@@ -562,6 +562,14 @@ class SQLStorage(BaseStorage):
 
         self.dialect = url.split(":", 1)[0].split("+", 1)[0].lower()
 
+        # 兼容 PgBouncer (transaction mode): 禁用 asyncpg prepared statement 缓存
+        # Supabase pooler (port 6543) 等均使用 PgBouncer，不支持 prepared statements
+        if self.dialect == "postgresql" and connect_args is None:
+            connect_args = {}
+        if self.dialect == "postgresql" and connect_args is not None:
+            connect_args.setdefault("statement_cache_size", 0)
+            connect_args.setdefault("prepared_statement_cache_size", 0)
+
         # 配置 robust 的连接池
         self.engine = create_async_engine(
             url,
