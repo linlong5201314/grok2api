@@ -6,6 +6,7 @@
     "**/*.py": {
       "includeFiles": [
         "app/**",
+        "app/static/**",
         "config.defaults.toml"
       ]
     }
