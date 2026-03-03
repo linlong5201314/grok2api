@@ -5,7 +5,8 @@
   "functions": {
     "**/*.py": {
       "includeFiles": [
-        "app/static/**"
+        "app/**",
+        "config.defaults.toml"
       ]
     }
   },
