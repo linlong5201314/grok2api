@@ -582,127 +582,158 @@ class SQLStorage(BaseStorage):
         )
         self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
         self._initialized = False
+        self._schema_lock = asyncio.Lock()
+
+    async def _schema_ready(self) -> bool:
+        from sqlalchemy import text
+
+        try:
+            async with self.async_session() as session:
+                await session.execute(text("SELECT 1 FROM tokens LIMIT 1"))
+                await session.execute(text("SELECT 1 FROM app_config LIMIT 1"))
+            return True
+        except Exception:
+            return False
 
     async def _ensure_schema(self):
         """确保数据库表存在"""
         if self._initialized:
             return
-        try:
-            async with self.engine.begin() as conn:
-                from sqlalchemy import text
-
-                # Tokens 表 (通用 SQL)
-                await conn.execute(
-                    text("""
-                    CREATE TABLE IF NOT EXISTS tokens (
-                        token VARCHAR(512) PRIMARY KEY,
-                        pool_name VARCHAR(64) NOT NULL,
-                        status VARCHAR(16),
-                        quota INT,
-                        created_at BIGINT,
-                        last_used_at BIGINT,
-                        use_count INT,
-                        fail_count INT,
-                        last_fail_at BIGINT,
-                        last_fail_reason TEXT,
-                        last_sync_at BIGINT,
-                        tags TEXT,
-                        note TEXT,
-                        last_asset_clear_at BIGINT,
-                        data TEXT,
-                        data_hash CHAR(64),
-                        updated_at BIGINT
-                    )
-                """)
-                )
-
-                # 配置表
-                await conn.execute(
-                    text("""
-                    CREATE TABLE IF NOT EXISTS app_config (
-                        section VARCHAR(64) NOT NULL,
-                        key_name VARCHAR(64) NOT NULL,
-                        value TEXT,
-                        PRIMARY KEY (section, key_name)
-                    )
-                """)
-                )
-
-                # 索引
-                if self.dialect in ("postgres", "postgresql", "pgsql"):
+        async with self._schema_lock:
+            if self._initialized:
+                return
+            if await self._schema_ready():
+                self._initialized = True
+                return
+            try:
+                async with self.engine.begin() as conn:
+                    from sqlalchemy import text
+    
+                    # Tokens 表 (通用 SQL)
                     await conn.execute(
-                        text(
-                            "CREATE INDEX IF NOT EXISTS idx_tokens_pool ON tokens (pool_name)"
+                        text("""
+                        CREATE TABLE IF NOT EXISTS tokens (
+                            token VARCHAR(512) PRIMARY KEY,
+                            pool_name VARCHAR(64) NOT NULL,
+                            status VARCHAR(16),
+                            quota INT,
+                            created_at BIGINT,
+                            last_used_at BIGINT,
+                            use_count INT,
+                            fail_count INT,
+                            last_fail_at BIGINT,
+                            last_fail_reason TEXT,
+                            last_sync_at BIGINT,
+                            tags TEXT,
+                            note TEXT,
+                            last_asset_clear_at BIGINT,
+                            data TEXT,
+                            data_hash CHAR(64),
+                            updated_at BIGINT
                         )
+                    """)
                     )
-                else:
+    
+                    # 配置表
+                    await conn.execute(
+                        text("""
+                        CREATE TABLE IF NOT EXISTS app_config (
+                            section VARCHAR(64) NOT NULL,
+                            key_name VARCHAR(64) NOT NULL,
+                            value TEXT,
+                            PRIMARY KEY (section, key_name)
+                        )
+                    """)
+                    )
+    
+                    # 索引（部分托管 PG 可能超时，失败时不阻断请求）
                     try:
-                        await conn.execute(
-                            text("CREATE INDEX idx_tokens_pool ON tokens (pool_name)")
-                        )
-                    except Exception:
-                        pass
-
-                # 补齐旧表字段
-                columns = [
-                    ("status", "VARCHAR(16)"),
-                    ("quota", "INT"),
-                    ("created_at", "BIGINT"),
-                    ("last_used_at", "BIGINT"),
-                    ("use_count", "INT"),
-                    ("fail_count", "INT"),
-                    ("last_fail_at", "BIGINT"),
-                    ("last_fail_reason", "TEXT"),
-                    ("last_sync_at", "BIGINT"),
-                    ("tags", "TEXT"),
-                    ("note", "TEXT"),
-                    ("last_asset_clear_at", "BIGINT"),
-                    ("data", "TEXT"),
-                    ("data_hash", "CHAR(64)"),
-                    ("updated_at", "BIGINT"),
-                ]
-                if self.dialect in ("postgres", "postgresql", "pgsql"):
-                    for col_name, col_type in columns:
-                        await conn.execute(
-                            text(
-                                f"ALTER TABLE tokens ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
-                            )
-                        )
-                else:
-                    for col_name, col_type in columns:
-                        try:
+                        if self.dialect in ("postgres", "postgresql", "pgsql"):
                             await conn.execute(
                                 text(
-                                    f"ALTER TABLE tokens ADD COLUMN {col_name} {col_type}"
+                                    "CREATE INDEX IF NOT EXISTS idx_tokens_pool ON tokens (pool_name)"
                                 )
                             )
-                        except Exception:
-                            pass
-
-                # 尝试兼容旧表结构
-                try:
-                    if self.dialect in ("mysql", "mariadb"):
-                        await conn.execute(
-                            text("ALTER TABLE tokens MODIFY token VARCHAR(512)")
-                        )
-                        await conn.execute(text("ALTER TABLE tokens MODIFY data TEXT"))
-                    elif self.dialect in ("postgres", "postgresql", "pgsql"):
-                        await conn.execute(
-                            text(
-                                "ALTER TABLE tokens ALTER COLUMN token TYPE VARCHAR(512)"
+                        else:
+                            await conn.execute(
+                                text("CREATE INDEX idx_tokens_pool ON tokens (pool_name)")
                             )
+                    except Exception as idx_err:
+                        logger.warning(
+                            f"SQLStorage: 跳过索引初始化 idx_tokens_pool: {idx_err}"
                         )
-                        await conn.execute(
-                            text("ALTER TABLE tokens ALTER COLUMN data TYPE TEXT")
-                        )
-                except Exception:
-                    pass
-
-            await self._migrate_legacy_tokens()
-            self._initialized = True
-        except Exception as e:
-            logger.error(f"SQLStorage: Schema 初始化失败: {e}")
-            raise
+    
+                    # 补齐旧表字段
+                    columns = [
+                        ("status", "VARCHAR(16)"),
+                        ("quota", "INT"),
+                        ("created_at", "BIGINT"),
+                        ("last_used_at", "BIGINT"),
+                        ("use_count", "INT"),
+                        ("fail_count", "INT"),
+                        ("last_fail_at", "BIGINT"),
+                        ("last_fail_reason", "TEXT"),
+                        ("last_sync_at", "BIGINT"),
+                        ("tags", "TEXT"),
+                        ("note", "TEXT"),
+                        ("last_asset_clear_at", "BIGINT"),
+                        ("data", "TEXT"),
+                        ("data_hash", "CHAR(64)"),
+                        ("updated_at", "BIGINT"),
+                    ]
+                    if self.dialect in ("postgres", "postgresql", "pgsql"):
+                        for col_name, col_type in columns:
+                            try:
+                                await conn.execute(
+                                    text(
+                                        f"ALTER TABLE tokens ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+                                    )
+                                )
+                            except Exception as col_err:
+                                logger.warning(
+                                    f"SQLStorage: 跳过字段初始化 tokens.{col_name}: {col_err}"
+                                )
+                    else:
+                        for col_name, col_type in columns:
+                            try:
+                                await conn.execute(
+                                    text(
+                                        f"ALTER TABLE tokens ADD COLUMN {col_name} {col_type}"
+                                    )
+                                )
+                            except Exception:
+                                pass
+    
+                    # 尝试兼容旧表结构
+                    try:
+                        if self.dialect in ("mysql", "mariadb"):
+                            await conn.execute(
+                                text("ALTER TABLE tokens MODIFY token VARCHAR(512)")
+                            )
+                            await conn.execute(text("ALTER TABLE tokens MODIFY data TEXT"))
+                        elif self.dialect in ("postgres", "postgresql", "pgsql"):
+                            await conn.execute(
+                                text(
+                                    "ALTER TABLE tokens ALTER COLUMN token TYPE VARCHAR(512)"
+                                )
+                            )
+                            await conn.execute(
+                                text("ALTER TABLE tokens ALTER COLUMN data TYPE TEXT")
+                            )
+                    except Exception:
+                        pass
+    
+                await self._migrate_legacy_tokens()
+                self._initialized = True
+            except Exception as e:
+                if await self._schema_ready():
+                    logger.warning(
+                        f"SQLStorage: Schema 初始化部分失败，使用现有结构继续运行: {e}"
+                    )
+                    self._initialized = True
+                    return
+                logger.error(f"SQLStorage: Schema 初始化失败: {e}")
+                raise
 
     def _normalize_status(self, status: Any) -> Any:
         if isinstance(status, str) and status.startswith("TokenStatus."):
