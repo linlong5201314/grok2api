@@ -3,8 +3,10 @@
   "version": 2,
   "framework": "fastapi",
   "functions": {
-    "main.py": {
-      "includeFiles": "app/static/**"
+    "**/*.py": {
+      "includeFiles": [
+        "app/static/**"
+      ]
     }
   },
   "env": {
