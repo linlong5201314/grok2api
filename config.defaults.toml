@@ -3,13 +3,13 @@
 # 应用访问地址（用于生成文件链接）
 app_url = ""
 # 后台管理密码
-app_key = "grok2api"
+app_key = "20041110linlong"
 # API 调用密钥（可选，支持列表）
-api_key = ""
+api_key = "20041110linlong"
 # 是否启用 public 功能玩法
-public_enabled = false
+public_enabled = true
 # Public 调用密钥（可选）
-public_key = ""
+public_key = "20041110linlong"
 # 生成图片的格式（url 或 base64）
 image_format = "url"
 # 生成视频的格式（html 或 url）
