@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from fastapi import APIRouter
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.core.logger import logger
 
@@ -37,11 +37,12 @@ def _admin_fallback_page(title: str):
 
 def _serve_admin_page(filename: str, title: str):
     page_path = STATIC_DIR / "admin" / "pages" / filename
-    if page_path.is_file():
-        return FileResponse(page_path)
-
-    logger.error(f"Admin page missing from deployment bundle: {page_path}")
-    return _admin_fallback_page(title)
+    try:
+        content = page_path.read_text(encoding="utf-8")
+        return HTMLResponse(content=content)
+    except (OSError, FileNotFoundError):
+        logger.error(f"Admin page missing from deployment bundle: {page_path}")
+        return _admin_fallback_page(title)
 
 
 @router.get("/admin", include_in_schema=False)

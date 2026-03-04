@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.core.auth import is_public_enabled
 from app.core.logger import logger
@@ -38,11 +38,12 @@ def _public_fallback_page(title: str):
 
 def _serve_public_page(filename: str, title: str):
     page_path = STATIC_DIR / "public" / "pages" / filename
-    if page_path.is_file():
-        return FileResponse(page_path)
-
-    logger.error(f"Public page missing from deployment bundle: {page_path}")
-    return _public_fallback_page(title)
+    try:
+        content = page_path.read_text(encoding="utf-8")
+        return HTMLResponse(content=content)
+    except (OSError, FileNotFoundError):
+        logger.error(f"Public page missing from deployment bundle: {page_path}")
+        return _public_fallback_page(title)
 
 
 @router.get("/", include_in_schema=False)
