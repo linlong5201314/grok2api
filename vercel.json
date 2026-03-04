@@ -2,15 +2,6 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
   "framework": "fastapi",
-  "functions": {
-    "**/*.py": {
-      "includeFiles": [
-        "app/**",
-        "app/static/**",
-        "config.defaults.toml"
-      ]
-    }
-  },
   "env": {
     "LOG_LEVEL": "INFO",
     "LOG_FILE_ENABLED": "false",
