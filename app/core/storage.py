@@ -18,6 +18,8 @@ import tomllib
 from typing import Any, ClassVar, Dict, Optional
 from pathlib import Path
 from enum import Enum
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from uuid import uuid4
 
 try:
     import fcntl
@@ -589,25 +591,69 @@ class SQLStorage(BaseStorage):
     def __init__(self, url: str, connect_args: dict | None = None):
         try:
             from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+            from sqlalchemy.pool import NullPool
         except ImportError:
             raise ImportError(
                 "需要安装 sqlalchemy 和 async 驱动: pip install sqlalchemy[asyncio]"
             )
 
         self.dialect = url.split(":", 1)[0].split("+", 1)[0].lower()
+        effective_connect_args = dict(connect_args or {})
+        engine_kwargs: dict[str, Any] = {
+            "echo": False,
+            "pool_recycle": 3600,
+            "pool_pre_ping": True,
+        }
 
-        # 配置 robust 的连接池
-        self.engine = create_async_engine(
-            url,
-            echo=False,
-            pool_size=20,
-            max_overflow=10,
-            pool_recycle=3600,
-            pool_pre_ping=True,
-            **({"connect_args": connect_args} if connect_args else {}),
-        )
+        if self.dialect in ("postgres", "postgresql", "pgsql") and "+asyncpg" in url:
+            # Supabase transaction pooler / PgBouncer is incompatible with asyncpg's
+            # default prepared statement caching. Disable it proactively.
+            effective_connect_args.setdefault("prepared_statement_cache_size", 0)
+            effective_connect_args.setdefault("statement_cache_size", 0)
+
+            if self._uses_external_pg_pooler(url):
+                effective_connect_args.setdefault(
+                    "prepared_statement_name_func",
+                    lambda: f"__asyncpg_{uuid4()}__",
+                )
+                engine_kwargs["poolclass"] = NullPool
+            else:
+                engine_kwargs.update(pool_size=20, max_overflow=10)
+        else:
+            engine_kwargs.update(pool_size=20, max_overflow=10)
+
+        if effective_connect_args:
+            engine_kwargs["connect_args"] = effective_connect_args
+
+        self.engine = create_async_engine(url, **engine_kwargs)
         self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
         self._initialized = False
+
+    @staticmethod
+    def _uses_external_pg_pooler(url: str) -> bool:
+        """Detect PgBouncer / Supabase transaction pooler style URLs."""
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False
+
+        host = (parsed.hostname or "").lower()
+        if host.endswith("pooler.supabase.com"):
+            return True
+
+        if parsed.port == 6543:
+            return True
+
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if key.lower() == "pgbouncer" and value.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                return True
+
+        return False
 
     async def _ensure_schema(self):
         """确保数据库表存在"""
@@ -1459,8 +1505,6 @@ class StorageFactory:
         cls, storage_type: str, url: str
     ) -> tuple[str, Optional[dict]]:
         """Normalize SQL URL and build connect_args from SSL query params."""
-        from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
-
         normalized_url = cls._normalize_sql_url(storage_type, url)
         if "://" not in normalized_url:
             return normalized_url, None
