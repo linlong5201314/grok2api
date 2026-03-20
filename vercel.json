@@ -1,11 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "fastapi",
-  "functions": {
-    "main.py": {
-      "excludeFiles": "{.git/**,.github/**,_public/**,docs/**,scripts/**,docker-compose.yml,Dockerfile,render.yaml,railway.toml,.env.example,.env.railway.example,config.runtime.example.toml}"
-    }
-  },
   "env": {
     "APP_URL": "https://grok.linlong.xyz",
     "BACKGROUND_JOBS_ENABLED": "false",
