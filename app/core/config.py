@@ -401,6 +401,19 @@ class Config:
             await storage.save_config(merged)
             self._config = merged
 
+    def merge_runtime_overrides(self, new_config: dict):
+        """仅在内存中合并运行时配置，不写回存储。"""
+        self._ensure_defaults()
+        base = _deep_merge(self._defaults, self._config or {})
+        merged = _deep_merge(base, new_config or {})
+        merged, removed_items = _prune_unknown_config(merged, self._defaults)
+        if removed_items:
+            logger.info(
+                "Removed unknown runtime config items: {}",
+                _summarize_removed(removed_items),
+            )
+        self._config = merged
+
 
 # 全局配置实例
 config = Config()

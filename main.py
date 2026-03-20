@@ -160,7 +160,7 @@ async def lifespan(app: FastAPI):
 
     runtime_env_overrides, applied_envs = _collect_runtime_env_overrides()
     if runtime_env_overrides:
-        await config.update(runtime_env_overrides)
+        config.merge_runtime_overrides(runtime_env_overrides)
         logger.info(
             "Applied runtime config from env: {}",
             sorted(applied_envs.keys()),

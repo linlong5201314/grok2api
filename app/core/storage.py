@@ -598,6 +598,8 @@ class SQLStorage(BaseStorage):
             )
 
         self.dialect = url.split(":", 1)[0].split("+", 1)[0].lower()
+        self._local_lock = asyncio.Lock()
+        self._uses_external_pooler = False
         effective_connect_args = dict(connect_args or {})
         engine_kwargs: dict[str, Any] = {
             "echo": False,
@@ -612,6 +614,7 @@ class SQLStorage(BaseStorage):
             effective_connect_args.setdefault("statement_cache_size", 0)
 
             if self._uses_external_pg_pooler(url):
+                self._uses_external_pooler = True
                 effective_connect_args.setdefault(
                     "prepared_statement_name_func",
                     lambda: f"__asyncpg_{uuid4()}__",
@@ -954,6 +957,14 @@ class SQLStorage(BaseStorage):
             lock_key = int.from_bytes(
                 hashlib.sha256(name.encode("utf-8")).digest()[:8], "big", signed=True
             )
+            if self._uses_external_pooler:
+                try:
+                    async with asyncio.timeout(timeout):
+                        async with self._local_lock:
+                            yield
+                except asyncio.TimeoutError:
+                    raise StorageError(f"SQLStorage: 无法获取锁 '{name}'")
+                return
             async with self.async_session() as session:
                 start = time.monotonic()
                 while True:
