@@ -600,6 +600,7 @@ class SQLStorage(BaseStorage):
         self.dialect = url.split(":", 1)[0].split("+", 1)[0].lower()
         self._local_lock = asyncio.Lock()
         self._uses_external_pooler = False
+        self._serverless_runtime = bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV"))
         effective_connect_args = dict(connect_args or {})
         engine_kwargs: dict[str, Any] = {
             "echo": False,
@@ -661,6 +662,11 @@ class SQLStorage(BaseStorage):
     async def _ensure_schema(self):
         """确保数据库表存在"""
         if self._initialized:
+            return
+        if self._serverless_runtime and self._uses_external_pooler:
+            # Vercel + Supabase pooler cold starts are too expensive for repeated
+            # DDL/bootstrap work. Reuse the existing schema and skip bootstrapping.
+            self._initialized = True
             return
         try:
             async with self.engine.begin() as conn:
