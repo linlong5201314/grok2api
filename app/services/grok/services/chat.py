@@ -22,7 +22,13 @@ from app.core.exceptions import (
 from app.services.grok.services.model import ModelService
 from app.services.grok.utils.upload import UploadService
 from app.services.grok.utils import process as proc_base
-from app.services.grok.utils.retry import pick_token, rate_limited, transient_upstream
+from app.services.grok.utils.retry import (
+    pick_token,
+    rate_limited,
+    transient_upstream,
+    upstream_reason,
+    upstream_status,
+)
 from app.services.reverse.app_chat import AppChatReverse
 from app.services.reverse.utils.session import ResettableSession
 from app.services.grok.utils.stream import wrap_stream_with_usage
@@ -476,6 +482,8 @@ class ChatService:
                     continue
 
                 if transient_upstream(e):
+                    status = upstream_status(e) or 502
+                    await token_mgr.record_fail(token, status, upstream_reason(e))
                     has_alternative_token = False
                     for pool_name in ModelService.pool_candidates_for_model(model):
                         if token_mgr.get_token(pool_name, exclude=tried_tokens):
@@ -512,6 +520,7 @@ class StreamProcessor(proc_base.BaseProcessor):
         self.fingerprint: str = ""
         self.rollout_id: str = ""
         self.think_opened: bool = False
+        self.think_closed_once: bool = False
         self.image_think_active: bool = False
         self.role_sent: bool = False
         self.filter_tags = get_config("app.filter_tags")
@@ -770,6 +779,7 @@ class StreamProcessor(proc_base.BaseProcessor):
                     if self.image_think_active and self.think_opened:
                         yield self._sse("\n</think>\n")
                         self.think_opened = False
+                        self.think_closed_once = True
                     self.image_think_active = False
                     for url in proc_base._collect_images(mr):
                         parts = url.split("/")
@@ -810,10 +820,15 @@ class StreamProcessor(proc_base.BaseProcessor):
                 if (token := resp.get("token")) is not None:
                     if not token:
                         continue
+                    if is_thinking and self.think_closed_once and not self.image_think_active:
+                        continue
                     filtered = self._filter_token(token)
                     if not filtered:
                         continue
-                    in_think = is_thinking or self.image_think_active
+                    in_think = (
+                        (is_thinking and not self.think_closed_once)
+                        or self.image_think_active
+                    )
                     if in_think:
                         if not self.show_think:
                             continue
@@ -824,6 +839,7 @@ class StreamProcessor(proc_base.BaseProcessor):
                         if self.think_opened:
                             yield self._sse("\n</think>\n")
                             self.think_opened = False
+                            self.think_closed_once = True
 
                     if in_think:
                         yield self._sse(filtered)
@@ -841,6 +857,7 @@ class StreamProcessor(proc_base.BaseProcessor):
 
             if self.think_opened:
                 yield self._sse("</think>\n")
+                self.think_closed_once = True
 
             if self._tool_stream_enabled:
                 for kind, payload in self._flush_tool_stream():

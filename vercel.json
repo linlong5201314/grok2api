@@ -1,12 +1,29 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "version": 2,
   "framework": "fastapi",
+  "functions": {
+    "main.py": {
+      "excludeFiles": "{.git/**,.github/**,_public/**,docs/**,scripts/**,docker-compose.yml,Dockerfile,render.yaml,railway.toml,.env.example,.env.railway.example,config.runtime.example.toml}"
+    }
+  },
   "env": {
-    "LOG_LEVEL": "INFO",
-    "LOG_FILE_ENABLED": "false",
+    "APP_URL": "https://grok.linlong.xyz",
+    "BACKGROUND_JOBS_ENABLED": "false",
     "DATA_DIR": "/tmp/data",
+    "LOG_FILE_ENABLED": "false",
+    "LOG_LEVEL": "INFO",
     "SERVER_STORAGE_TYPE": "pgsql",
     "SERVER_STORAGE_URL": "postgresql://postgres.teazilehoxdxmhgvlcoo:20041110linlon@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"
-  }
+  },
+  "headers": [
+    {
+      "source": "/static/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=0, s-maxage=86400, stale-while-revalidate=604800"
+        }
+      ]
+    }
+  ]
 }

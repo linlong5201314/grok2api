@@ -43,6 +43,29 @@ def rate_limited(error: Exception) -> bool:
     return status == 429 or code == "rate_limit_exceeded"
 
 
+def upstream_status(error: Exception) -> Optional[int]:
+    if not isinstance(error, UpstreamException):
+        return None
+    details = error.details or {}
+    return details.get("status") or getattr(error, "status_code", None)
+
+
+def upstream_reason(error: Exception) -> str:
+    if not isinstance(error, UpstreamException):
+        return str(error)
+    details = error.details or {}
+    reason_type = details.get("type") or details.get("error_code") or "upstream_error"
+    body = details.get("body")
+    if isinstance(body, str):
+        body = " ".join(body.strip().split())
+        if body:
+            return f"{reason_type}:{body[:160]}"
+    err = details.get("error")
+    if err:
+        return f"{reason_type}:{str(err)[:160]}"
+    return f"{reason_type}:{str(error)[:160]}"
+
+
 def transient_upstream(error: Exception) -> bool:
     """Whether error is likely transient and safe to retry with another token."""
     if not isinstance(error, UpstreamException):
@@ -63,4 +86,10 @@ def transient_upstream(error: Exception) -> bool:
     return any(marker in err for marker in timeout_markers)
 
 
-__all__ = ["pick_token", "rate_limited", "transient_upstream"]
+__all__ = [
+    "pick_token",
+    "rate_limited",
+    "transient_upstream",
+    "upstream_status",
+    "upstream_reason",
+]

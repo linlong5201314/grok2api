@@ -17,7 +17,13 @@ from app.core.logger import logger
 from app.core.storage import DATA_DIR
 from app.core.exceptions import AppException, ErrorType, UpstreamException
 from app.services.grok.utils.process import BaseProcessor
-from app.services.grok.utils.retry import pick_token, rate_limited
+from app.services.grok.utils.retry import (
+    pick_token,
+    rate_limited,
+    transient_upstream,
+    upstream_reason,
+    upstream_status,
+)
 from app.services.grok.utils.response import make_response_id, make_chat_chunk, wrap_image_content
 from app.services.grok.utils.stream import wrap_stream_with_usage
 from app.services.token import EffortType
@@ -114,6 +120,19 @@ class ImageGenerationService:
                                 f"trying next token (attempt {attempt + 1}/{max_token_retries})"
                             )
                             continue
+                        if transient_upstream(e):
+                            if yielded:
+                                raise
+                            await token_mgr.record_fail(
+                                current_token,
+                                upstream_status(e) or 502,
+                                upstream_reason(e),
+                            )
+                            logger.warning(
+                                f"Transient upstream error for token {current_token[:10]}..., "
+                                f"trying next token (attempt {attempt + 1}/{max_token_retries})"
+                            )
+                            continue
                         raise
 
                 if last_error:
@@ -165,6 +184,17 @@ class ImageGenerationService:
                     await token_mgr.mark_rate_limited(current_token)
                     logger.warning(
                         f"Token {current_token[:10]}... rate limited (429), "
+                        f"trying next token (attempt {attempt + 1}/{max_token_retries})"
+                    )
+                    continue
+                if transient_upstream(e):
+                    await token_mgr.record_fail(
+                        current_token,
+                        upstream_status(e) or 502,
+                        upstream_reason(e),
+                    )
+                    logger.warning(
+                        f"Transient upstream error for token {current_token[:10]}..., "
                         f"trying next token (attempt {attempt + 1}/{max_token_retries})"
                     )
                     continue

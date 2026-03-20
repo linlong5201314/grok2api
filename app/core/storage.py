@@ -52,6 +52,26 @@ def json_dumps_sorted(obj: Any) -> str:
     return orjson.dumps(obj, option=orjson.OPT_SORT_KEYS).decode("utf-8")
 
 
+def has_token_entries(data: Any) -> bool:
+    """Return True when the payload contains at least one non-empty token."""
+    if not isinstance(data, dict):
+        return False
+
+    for tokens in data.values():
+        if not isinstance(tokens, list):
+            continue
+        for item in tokens:
+            if isinstance(item, str):
+                if item.strip():
+                    return True
+                continue
+            if isinstance(item, dict):
+                token = item.get("token")
+                if isinstance(token, str) and token.strip():
+                    return True
+    return False
+
+
 class StorageError(Exception):
     """存储服务基础异常"""
 
@@ -236,8 +256,8 @@ class LocalStorage(BaseStorage):
                     if isinstance(val, bool):
                         val_str = "true" if val else "false"
                     elif isinstance(val, str):
-                        escaped = val.replace('"', '\\"')
-                        val_str = f'"{escaped}"'
+                        # Use JSON string escaping to keep TOML valid for multiline/control chars.
+                        val_str = json_dumps(val)
                     elif isinstance(val, (int, float)):
                         val_str = str(val)
                     elif isinstance(val, (list, dict)):
@@ -269,6 +289,13 @@ class LocalStorage(BaseStorage):
 
     async def save_tokens(self, data: Dict[str, Any]):
         try:
+            if not has_token_entries(data):
+                existing = await self.load_tokens() or {}
+                if has_token_entries(existing):
+                    logger.warning(
+                        "LocalStorage: 跳过空 Token 全量保存，避免覆盖已有数据"
+                    )
+                    return
             TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
             temp_path = TOKEN_FILE.with_suffix(".tmp")
 
@@ -489,6 +516,13 @@ class RedisStorage(BaseStorage):
                 for tokens in pool_tokens_res:
                     existing_token_ids.update(list(tokens or []))
 
+            if not new_token_ids:
+                if existing_token_ids:
+                    logger.warning(
+                        "RedisStorage: 跳过空 Token 全量保存，避免删除已有数据"
+                    )
+                return
+
             tokens_to_delete = existing_token_ids - new_token_ids
             all_pools = existing_pools.union(new_pools)
 
@@ -562,14 +596,6 @@ class SQLStorage(BaseStorage):
 
         self.dialect = url.split(":", 1)[0].split("+", 1)[0].lower()
 
-        # 兼容 PgBouncer (transaction mode): 禁用 asyncpg prepared statement 缓存
-        # Supabase pooler (port 6543) 等均使用 PgBouncer，不支持 prepared statements
-        if self.dialect == "postgresql" and connect_args is None:
-            connect_args = {}
-        if self.dialect == "postgresql" and connect_args is not None:
-            connect_args.setdefault("statement_cache_size", 0)
-            connect_args.setdefault("prepared_statement_cache_size", 0)
-
         # 配置 robust 的连接池
         self.engine = create_async_engine(
             url,
@@ -582,158 +608,127 @@ class SQLStorage(BaseStorage):
         )
         self.async_session = async_sessionmaker(self.engine, expire_on_commit=False)
         self._initialized = False
-        self._schema_lock = asyncio.Lock()
-
-    async def _schema_ready(self) -> bool:
-        from sqlalchemy import text
-
-        try:
-            async with self.async_session() as session:
-                await session.execute(text("SELECT 1 FROM tokens LIMIT 1"))
-                await session.execute(text("SELECT 1 FROM app_config LIMIT 1"))
-            return True
-        except Exception:
-            return False
 
     async def _ensure_schema(self):
         """确保数据库表存在"""
         if self._initialized:
             return
-        async with self._schema_lock:
-            if self._initialized:
-                return
-            if await self._schema_ready():
-                self._initialized = True
-                return
-            try:
-                async with self.engine.begin() as conn:
-                    from sqlalchemy import text
-    
-                    # Tokens 表 (通用 SQL)
-                    await conn.execute(
-                        text("""
-                        CREATE TABLE IF NOT EXISTS tokens (
-                            token VARCHAR(512) PRIMARY KEY,
-                            pool_name VARCHAR(64) NOT NULL,
-                            status VARCHAR(16),
-                            quota INT,
-                            created_at BIGINT,
-                            last_used_at BIGINT,
-                            use_count INT,
-                            fail_count INT,
-                            last_fail_at BIGINT,
-                            last_fail_reason TEXT,
-                            last_sync_at BIGINT,
-                            tags TEXT,
-                            note TEXT,
-                            last_asset_clear_at BIGINT,
-                            data TEXT,
-                            data_hash CHAR(64),
-                            updated_at BIGINT
-                        )
-                    """)
+        try:
+            async with self.engine.begin() as conn:
+                from sqlalchemy import text
+
+                # Tokens 表 (通用 SQL)
+                await conn.execute(
+                    text("""
+                    CREATE TABLE IF NOT EXISTS tokens (
+                        token VARCHAR(512) PRIMARY KEY,
+                        pool_name VARCHAR(64) NOT NULL,
+                        status VARCHAR(16),
+                        quota INT,
+                        created_at BIGINT,
+                        last_used_at BIGINT,
+                        use_count INT,
+                        fail_count INT,
+                        last_fail_at BIGINT,
+                        last_fail_reason TEXT,
+                        last_sync_at BIGINT,
+                        tags TEXT,
+                        note TEXT,
+                        last_asset_clear_at BIGINT,
+                        data TEXT,
+                        data_hash CHAR(64),
+                        updated_at BIGINT
                     )
-    
-                    # 配置表
-                    await conn.execute(
-                        text("""
-                        CREATE TABLE IF NOT EXISTS app_config (
-                            section VARCHAR(64) NOT NULL,
-                            key_name VARCHAR(64) NOT NULL,
-                            value TEXT,
-                            PRIMARY KEY (section, key_name)
-                        )
-                    """)
+                """)
+                )
+
+                # 配置表
+                await conn.execute(
+                    text("""
+                    CREATE TABLE IF NOT EXISTS app_config (
+                        section VARCHAR(64) NOT NULL,
+                        key_name VARCHAR(64) NOT NULL,
+                        value TEXT,
+                        PRIMARY KEY (section, key_name)
                     )
-    
-                    # 索引（部分托管 PG 可能超时，失败时不阻断请求）
-                    try:
-                        if self.dialect in ("postgres", "postgresql", "pgsql"):
-                            await conn.execute(
-                                text(
-                                    "CREATE INDEX IF NOT EXISTS idx_tokens_pool ON tokens (pool_name)"
-                                )
-                            )
-                        else:
-                            await conn.execute(
-                                text("CREATE INDEX idx_tokens_pool ON tokens (pool_name)")
-                            )
-                    except Exception as idx_err:
-                        logger.warning(
-                            f"SQLStorage: 跳过索引初始化 idx_tokens_pool: {idx_err}"
+                """)
+                )
+
+                # 索引
+                if self.dialect in ("postgres", "postgresql", "pgsql"):
+                    await conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS idx_tokens_pool ON tokens (pool_name)"
                         )
-    
-                    # 补齐旧表字段
-                    columns = [
-                        ("status", "VARCHAR(16)"),
-                        ("quota", "INT"),
-                        ("created_at", "BIGINT"),
-                        ("last_used_at", "BIGINT"),
-                        ("use_count", "INT"),
-                        ("fail_count", "INT"),
-                        ("last_fail_at", "BIGINT"),
-                        ("last_fail_reason", "TEXT"),
-                        ("last_sync_at", "BIGINT"),
-                        ("tags", "TEXT"),
-                        ("note", "TEXT"),
-                        ("last_asset_clear_at", "BIGINT"),
-                        ("data", "TEXT"),
-                        ("data_hash", "CHAR(64)"),
-                        ("updated_at", "BIGINT"),
-                    ]
-                    if self.dialect in ("postgres", "postgresql", "pgsql"):
-                        for col_name, col_type in columns:
-                            try:
-                                await conn.execute(
-                                    text(
-                                        f"ALTER TABLE tokens ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
-                                    )
-                                )
-                            except Exception as col_err:
-                                logger.warning(
-                                    f"SQLStorage: 跳过字段初始化 tokens.{col_name}: {col_err}"
-                                )
-                    else:
-                        for col_name, col_type in columns:
-                            try:
-                                await conn.execute(
-                                    text(
-                                        f"ALTER TABLE tokens ADD COLUMN {col_name} {col_type}"
-                                    )
-                                )
-                            except Exception:
-                                pass
-    
-                    # 尝试兼容旧表结构
+                    )
+                else:
                     try:
-                        if self.dialect in ("mysql", "mariadb"):
-                            await conn.execute(
-                                text("ALTER TABLE tokens MODIFY token VARCHAR(512)")
-                            )
-                            await conn.execute(text("ALTER TABLE tokens MODIFY data TEXT"))
-                        elif self.dialect in ("postgres", "postgresql", "pgsql"):
-                            await conn.execute(
-                                text(
-                                    "ALTER TABLE tokens ALTER COLUMN token TYPE VARCHAR(512)"
-                                )
-                            )
-                            await conn.execute(
-                                text("ALTER TABLE tokens ALTER COLUMN data TYPE TEXT")
-                            )
+                        await conn.execute(
+                            text("CREATE INDEX idx_tokens_pool ON tokens (pool_name)")
+                        )
                     except Exception:
                         pass
-    
-                await self._migrate_legacy_tokens()
-                self._initialized = True
-            except Exception as e:
-                if await self._schema_ready():
-                    logger.warning(
-                        f"SQLStorage: Schema 初始化部分失败，使用现有结构继续运行: {e}"
-                    )
-                    self._initialized = True
-                    return
-                logger.error(f"SQLStorage: Schema 初始化失败: {e}")
-                raise
+
+                # 补齐旧表字段
+                columns = [
+                    ("status", "VARCHAR(16)"),
+                    ("quota", "INT"),
+                    ("created_at", "BIGINT"),
+                    ("last_used_at", "BIGINT"),
+                    ("use_count", "INT"),
+                    ("fail_count", "INT"),
+                    ("last_fail_at", "BIGINT"),
+                    ("last_fail_reason", "TEXT"),
+                    ("last_sync_at", "BIGINT"),
+                    ("tags", "TEXT"),
+                    ("note", "TEXT"),
+                    ("last_asset_clear_at", "BIGINT"),
+                    ("data", "TEXT"),
+                    ("data_hash", "CHAR(64)"),
+                    ("updated_at", "BIGINT"),
+                ]
+                if self.dialect in ("postgres", "postgresql", "pgsql"):
+                    for col_name, col_type in columns:
+                        await conn.execute(
+                            text(
+                                f"ALTER TABLE tokens ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+                            )
+                        )
+                else:
+                    for col_name, col_type in columns:
+                        try:
+                            await conn.execute(
+                                text(
+                                    f"ALTER TABLE tokens ADD COLUMN {col_name} {col_type}"
+                                )
+                            )
+                        except Exception:
+                            pass
+
+                # 尝试兼容旧表结构
+                try:
+                    if self.dialect in ("mysql", "mariadb"):
+                        await conn.execute(
+                            text("ALTER TABLE tokens MODIFY token VARCHAR(512)")
+                        )
+                        await conn.execute(text("ALTER TABLE tokens MODIFY data TEXT"))
+                    elif self.dialect in ("postgres", "postgresql", "pgsql"):
+                        await conn.execute(
+                            text(
+                                "ALTER TABLE tokens ALTER COLUMN token TYPE VARCHAR(512)"
+                            )
+                        )
+                        await conn.execute(
+                            text("ALTER TABLE tokens ALTER COLUMN data TYPE TEXT")
+                        )
+                except Exception:
+                    pass
+
+            await self._migrate_legacy_tokens()
+            self._initialized = True
+        except Exception as e:
+            logger.error(f"SQLStorage: Schema 初始化失败: {e}")
+            raise
 
     def _normalize_status(self, status: Any) -> Any:
         if isinstance(status, str) and status.startswith("TokenStatus."):
@@ -1121,6 +1116,12 @@ class SQLStorage(BaseStorage):
                 res = await session.execute(text("SELECT token FROM tokens"))
                 rows = res.fetchall()
                 existing_tokens = {row[0] for row in rows}
+            if not new_tokens:
+                if existing_tokens:
+                    logger.warning(
+                        "SQLStorage: 跳过空 Token 全量保存，避免删除已有数据"
+                    )
+                return
             tokens_to_delete = list(existing_tokens - new_tokens)
             await self.save_tokens_delta(updates, tokens_to_delete)
         except Exception as e:

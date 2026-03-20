@@ -39,6 +39,7 @@ env/
 .env
 .env.local
 .env.*.local
+.vercel/
 
 # Logs
 logs/
@@ -55,3 +56,4 @@ htmlcov/
 
 # Project specific
 config.local.toml
+.ace-tool/

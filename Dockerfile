@@ -41,7 +41,11 @@ FROM python:3.13-alpine
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
-    VIRTUAL_ENV=/opt/venv
+    VIRTUAL_ENV=/opt/venv \
+    SERVER_HOST=0.0.0.0 \
+    SERVER_PORT=8000 \
+    PORT=8000 \
+    SERVER_WORKERS=1
 
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
@@ -60,14 +64,16 @@ COPY --from=builder /opt/venv /opt/venv
 
 COPY config.defaults.toml ./
 COPY app ./app
+COPY _public ./_public
 COPY main.py ./
 COPY scripts ./scripts
 
 RUN mkdir -p /app/data /app/logs \
-    && chmod +x /app/scripts/entrypoint.sh
+    && sed -i 's/\r$//' /app/scripts/*.sh \
+    && chmod +x /app/scripts/*.sh
 
 EXPOSE 8000
 
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "granian --interface asgi --host ${SERVER_HOST:-0.0.0.0} --port ${PORT:-${SERVER_PORT:-8000}} --workers ${SERVER_WORKERS:-1} main:app"]

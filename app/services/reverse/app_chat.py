@@ -9,10 +9,11 @@ from curl_cffi.requests import AsyncSession
 
 from app.core.logger import logger
 from app.core.config import get_config
+from app.core.proxy_pool import get_current_proxy_from, rotate_proxy, should_rotate_proxy
 from app.core.exceptions import UpstreamException
 from app.services.token.service import TokenService
 from app.services.reverse.utils.headers import build_headers
-from app.services.reverse.utils.retry import retry_on_status
+from app.services.reverse.utils.retry import extract_status_for_retry, retry_on_status
 
 CHAT_API = "https://grok.com/rest/app-chat/conversations/new"
 
@@ -34,6 +35,18 @@ class AppChatReverse:
     """/rest/app-chat/conversations/new reverse interface."""
 
     @staticmethod
+    def _resolve_custom_personality() -> Optional[str]:
+        """Resolve optional custom personality from app config."""
+        value = get_config("app.custom_instruction", "")
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            value = str(value)
+        if not value.strip():
+            return None
+        return value
+
+    @staticmethod
     def build_payload(
         message: str,
         model: str,
@@ -50,10 +63,10 @@ class AppChatReverse:
             "deviceEnvInfo": {
                 "darkModeEnabled": False,
                 "devicePixelRatio": 2,
-                "screenWidth": 2056,
                 "screenHeight": 1329,
-                "viewportWidth": 2056,
+                "screenWidth": 2056,
                 "viewportHeight": 1083,
+                "viewportWidth": 2056,
             },
             "disableMemory": get_config("app.disable_memory"),
             "disableSearch": False,
@@ -82,8 +95,18 @@ class AppChatReverse:
             "toolOverrides": tool_overrides or {},
         }
 
+        if model == "grok-420":
+            payload["enable420"] = True
+
+        custom_personality = AppChatReverse._resolve_custom_personality()
+        if custom_personality is not None:
+            payload["customPersonality"] = custom_personality
+
         if model_config_override:
             payload["responseMetadata"]["modelConfigOverride"] = model_config_override
+
+        import json
+        logger.debug(f"AppChatReverse payload: {json.dumps(payload, indent=4, ensure_ascii=False)}")
 
         return payload
 
@@ -114,24 +137,6 @@ class AppChatReverse:
             Any: The response from the request.
         """
         try:
-            # Get proxies
-            base_proxy = get_config("proxy.base_proxy_url")
-            proxy = None
-            proxies = None
-            if base_proxy:
-                normalized_proxy = _normalize_chat_proxy(base_proxy)
-                scheme = urlparse(normalized_proxy).scheme.lower()
-                if scheme.startswith("socks"):
-                    # curl_cffi 对 SOCKS 代理优先使用 proxy 参数，避免被按 HTTP CONNECT 处理
-                    proxy = normalized_proxy
-                else:
-                    proxies = {"http": normalized_proxy, "https": normalized_proxy}
-                logger.info(
-                    f"AppChatReverse proxy enabled: scheme={scheme}, target={normalized_proxy}"
-                )
-            else:
-                logger.warning("AppChatReverse proxy is empty, request will use direct network")
-
             # Build headers
             headers = build_headers(
                 cookie_token=token,
@@ -149,6 +154,17 @@ class AppChatReverse:
                 tool_overrides=tool_overrides,
                 model_config_override=model_config_override,
             )
+            payload_summary = {
+                "model": payload.get("modelName"),
+                "mode": payload.get("modelMode"),
+                "message_len": payload.get("message") or "",
+                "file_attachments": len(payload.get("fileAttachments") or []),
+                "custom_personality_len": len(payload.get("customPersonality") or ""),
+            }
+            logger.debug(
+                "AppChatReverse final Grok params (redacted)",
+                extra={"grok_payload": payload_summary},
+            )
 
             # Curl Config
             timeout = float(get_config("chat.timeout") or 0)
@@ -158,8 +174,28 @@ class AppChatReverse:
                     float(get_config("image.timeout") or 0),
                 )
             browser = get_config("proxy.browser")
+            active_proxy_key = None
 
             async def _do_request():
+                nonlocal active_proxy_key
+                active_proxy_key, base_proxy = get_current_proxy_from("proxy.base_proxy_url")
+                proxy = None
+                proxies = None
+                if base_proxy:
+                    normalized_proxy = _normalize_chat_proxy(base_proxy)
+                    scheme = urlparse(normalized_proxy).scheme.lower()
+                    if scheme.startswith("socks"):
+                        # curl_cffi 对 SOCKS 代理优先使用 proxy 参数，避免被按 HTTP CONNECT 处理
+                        proxy = normalized_proxy
+                    else:
+                        proxies = {"http": normalized_proxy, "https": normalized_proxy}
+                    logger.info(
+                        f"AppChatReverse proxy enabled: scheme={scheme}, target={normalized_proxy}"
+                    )
+                else:
+                    logger.warning(
+                        "AppChatReverse proxy is empty, request will use direct network"
+                    )
                 response = await session.post(
                     CHAT_API,
                     headers=headers,
@@ -172,13 +208,19 @@ class AppChatReverse:
                 )
 
                 if response.status_code != 200:
-
-                    # Get response content
                     content = ""
                     try:
                         content = await response.text()
                     except Exception:
                         pass
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    body_preview = " ".join(content.split())[:300] if content else ""
+                    error_type = "upstream_error"
+                    if content and "application/json" not in content_type:
+                        error_type = "non_json_error_body"
+                        lowered = content.lower()
+                        if "<html" in lowered or "<!doctype" in lowered:
+                            error_type = "html_error_body"
 
                     logger.debug(
                         "AppChatReverse: Chat failed response body: %s",
@@ -190,23 +232,31 @@ class AppChatReverse:
                     )
                     raise UpstreamException(
                         message=f"AppChatReverse: Chat failed, {response.status_code}",
-                        details={"status": response.status_code, "body": content},
+                        details={
+                            "status": response.status_code,
+                            "body": body_preview,
+                            "content_type": content_type,
+                            "type": error_type,
+                        },
                     )
 
                 return response
 
             def extract_status(e: Exception) -> Optional[int]:
-                if isinstance(e, UpstreamException):
-                    if e.details and "status" in e.details:
-                        status = e.details["status"]
-                    else:
-                        status = getattr(e, "status_code", None)
-                    if status == 429:
-                        return None
-                    return status
-                return None
+                status = extract_status_for_retry(e)
+                if status == 429:
+                    return None
+                return status
 
-            response = await retry_on_status(_do_request, extract_status=extract_status)
+            async def _on_retry(attempt: int, status_code: int, error: Exception, delay: float):
+                if active_proxy_key and should_rotate_proxy(status_code):
+                    rotate_proxy(active_proxy_key)
+
+            response = await retry_on_status(
+                _do_request,
+                extract_status=extract_status,
+                on_retry=_on_retry,
+            )
 
             # Stream response
             async def stream_response():

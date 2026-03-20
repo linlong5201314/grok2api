@@ -1,6 +1,6 @@
 # Grok2API
 
-**中文** | [English](docs/README.en.md)
+**中文** | [English](docs/README.en.md) | [文档](https://blog.cheny.me/blog/posts/grok2api)
 
 > [!NOTE]
 > 本项目仅供学习与研究，使用者必须在遵循 Grok 的 **使用条款** 以及 **法律法规** 的情况下使用，不得用于非法用途。
@@ -15,30 +15,48 @@
 <br>
 
 ## 快速开始
+> [文档](https://blog.cheny.me/blog/posts/grok2api)
 
 ### 本地开发
 
 ```bash
 uv sync
-uv run main.py
+
+uv run granian --interface asgi --host 0.0.0.0 --port 8000 --workers 1 main:app
 ```
 
 ### Docker Compose
 
 ```bash
 git clone https://github.com/chenyme/grok2api
+
 cd grok2api
 
 docker compose up -d
 ```
 
-### Vercel 部署
-
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/chenyme/grok2api&env=LOG_LEVEL,LOG_FILE_ENABLED,DATA_DIR,SERVER_STORAGE_TYPE,SERVER_STORAGE_URL&envDefaults=%7B%22DATA_DIR%22%3A%22/tmp/data%22%2C%22LOG_FILE_ENABLED%22%3A%22false%22%2C%22LOG_LEVEL%22%3A%22INFO%22%2C%22SERVER_STORAGE_TYPE%22%3A%22local%22%2C%22SERVER_STORAGE_URL%22%3A%22%22%7D)
-
-> 请务必设置 `DATA_DIR=/tmp/data` 并关闭文件日志 `LOG_FILE_ENABLED=false`。
+> Docker Compose 端口变量：
 >
-> 持久化请使用 MySQL / Redis / PostgreSQL，并设置：`SERVER_STORAGE_TYPE` 与 `SERVER_STORAGE_URL`。
+> - `SERVER_PORT`：容器内应用监听端口
+> - `HOST_PORT`：宿主机映射端口（仅 Docker Compose 使用）
+>
+> 小贴士：端口映射规则是 `HOST_PORT:SERVER_PORT`，你访问的是 `HOST_PORT`，容器内服务实际监听的是 `SERVER_PORT`。
+>
+> 示例：`HOST_PORT=9000 SERVER_PORT=8011 docker compose up -d`，访问 `http://localhost:9000`。
+
+### Railway 部署
+
+推荐使用 Railway + Volume 的单实例部署方案。
+
+> 参考部署模板：`railway.toml`
+>
+> 环境变量模板：`.env.railway.example`
+>
+> 完整说明：`docs/RAILWAY.md`
+>
+> 推荐挂载 Volume 到 `/app/data`，并设置 `SERVER_STORAGE_TYPE=local`。
+>
+> 单实例场景不需要 Redis。
 
 ### Render 部署
 
@@ -52,7 +70,7 @@ docker compose up -d
 
 ## 管理面板
 
-- 访问地址：`http://<host>:8000/admin`
+- 访问地址：`http://<host>:<port>/admin`（本地运行使用 `SERVER_PORT`，Docker Compose 使用 `HOST_PORT`，默认均为 `8000`）
 - 默认密码：`grok2api`（配置项 `app.app_key`，建议修改）
 
 **功能说明**：
@@ -68,7 +86,7 @@ docker compose up -d
 
 ## 环境变量
 
-> 配置 `.env` 文件
+> 配置 `.env` 文件，可直接参考 `.env.example` 或 `.env.railway.example`
 
 | 变量名 | 说明 | 默认值 | 示例 |
 | :-- | :-- | :-- | :-- |
@@ -77,8 +95,9 @@ docker compose up -d
 | `DATA_DIR` | 数据目录（配置/Token/锁） | `./data` | `/data` |
 | `SERVER_HOST` | 服务监听地址 | `0.0.0.0` | `0.0.0.0` |
 | `SERVER_PORT` | 服务端口 | `8000` | `8000` |
-| `SERVER_WORKERS` | Uvicorn worker 数量 | `1` | `2` |
-| `SERVER_STORAGE_TYPE` | 存储类型（`local`/`redis`/`mysql`/`pgsql`） | `local` | `pgsql` |
+| `HOST_PORT` | Docker Compose 宿主机映射端口 | `8000` | `9000` |
+| `SERVER_WORKERS` | 服务进程数量 | `1` | `2` |
+| `SERVER_STORAGE_TYPE` | 存储类型（`local`/`redis`/`mysql`/`pgsql`） | `local` | `local` |
 | `SERVER_STORAGE_URL` | 存储连接串（local 时可为空） | `""` | `postgresql+asyncpg://user:password@host:5432/db` |
 
 > MySQL 示例：`mysql+aiomysql://user:password@host:3306/db`（若填 `mysql://` 会自动转为 `mysql+aiomysql://`）
@@ -100,7 +119,6 @@ docker compose up -d
 | `grok-3-mini` | 1 | Basic/Super | 支持 | 支持 | - |
 | `grok-3-thinking` | 1 | Basic/Super | 支持 | 支持 | - |
 | `grok-4` | 1 | Basic/Super | 支持 | 支持 | - |
-| `grok-4-mini` | 1 | Basic/Super | 支持 | 支持 | - |
 | `grok-4-thinking` | 1 | Basic/Super | 支持 | 支持 | - |
 | `grok-4-heavy` | 4 | Super | 支持 | 支持 | - |
 | `grok-4.1-mini` | 1 | Basic/Super | 支持 | 支持 | - |
@@ -116,6 +134,8 @@ docker compose up -d
 <br>
 
 ## 接口说明
+
+> 以下示例默认使用 `localhost:8000`；若 Docker Compose 设置了 `HOST_PORT`，请替换为对应端口。
 
 ### `POST /v1/chat/completions`
 
@@ -149,7 +169,7 @@ curl http://localhost:8000/v1/chat/completions \
 | `parallel_tool_calls` | boolean | 是否允许并行工具调用 | `true`, `false` |
 | `video_config` | object | **视频模型专用配置对象** | 支持：`grok-imagine-1.0-video` |
 | └─`aspect_ratio` | string | 视频宽高比 | `16:9`, `9:16`, `1:1`, `2:3`, `3:2`, `1280x720`, `720x1280`, `1792x1024`, `1024x1792`, `1024x1024` |
-| └─`video_length` | integer | 视频时长 (秒) | `6`, `10`, `15` |
+| └─`video_length` | integer | 视频时长 (秒) | `6` ~ `30` |
 | └─`resolution_name` | string | 分辨率 | `480p`, `720p` |
 | └─`preset` | string | 风格预设 | `fun`, `normal`, `spicy`, `custom` |
 | `image_config` | object | **图片模型专用配置对象** | 支持：`grok-imagine-1.0` / `grok-imagine-1.0-fast` / `grok-imagine-1.0-edit` |
@@ -319,6 +339,51 @@ curl http://localhost:8000/v1/images/edits \
 
 <br>
 
+### `POST /v1/videos`
+
+> 视频生成接口（OpenAI videos.create 兼容）
+
+```bash
+curl http://localhost:8000/v1/videos \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $GROK2API_API_KEY" \
+  -d '{
+    "model": "grok-imagine-1.0-video",
+    "prompt": "霓虹雨夜街头，慢镜头追拍",
+    "size": "1792x1024",
+    "seconds": 18,
+    "quality": "standard"
+  }'
+```
+
+<details>
+<summary>支持的请求参数</summary>
+
+<br>
+
+| 字段 | 类型 | 说明 | 可用参数 |
+| :-- | :-- | :-- | :-- |
+| `model` | string | 视频模型名 | `grok-imagine-1.0-video` |
+| `prompt` | string | 视频提示词 | - |
+| `size` | string | 画面比例（会映射到 aspect_ratio） | `1280x720`, `720x1280`, `1792x1024`, `1024x1792`, `1024x1024` |
+| `seconds` | integer | 目标时长（秒） | `6` ~ `30` |
+| `quality` | string | 视频质量（映射到 resolution） | `standard`, `high` |
+| `image_reference` | object/string | 参考图（可选） | `{"image_url":"https://..."}` 或 Data URI |
+| `input_reference` | file | multipart 参考图（可选） | `png`, `jpg`, `webp` |
+
+**注意事项**：
+
+- 服务端已支持 6~30 秒自动链式扩展，**无需使用 `/v1/video/extend`**。
+- `quality=standard` 对应 `480p`；`quality=high` 对应 `720p`。
+- 基础号池请求 `720p` 时会先产出 `480p` 再按 `video.upscale_timing` 执行超分。
+- `image_reference` 与 `input_reference` 同时传入时，会按顺序作为参考图输入；视频链路只使用第 1 张。
+
+<br>
+
+</details>
+
+<br>
+
 ## 参数配置
 
 配置文件：`data/config.toml`
@@ -336,8 +401,8 @@ curl http://localhost:8000/v1/images/edits \
 | **app** | `app_url` | 应用地址 | 当前 Grok2API 服务的外部访问 URL，用于文件链接访问。 | `""` |
 |  | `app_key` | 后台密码 | 登录 Grok2API 管理后台的密码（必填）。 | `grok2api` |
 |  | `api_key` | API 密钥 | 调用 Grok2API 服务的 Token（可选，支持逗号分隔或数组）。 | `""` |
-|  | `public_enabled` | Public 开关 | 是否启用 public 功能玩法。 | `false` |
-|  | `public_key` | Public 密钥 | Public 调用密钥（可选）。 | `""` |
+|  | `function_enabled` | Function 开关 | 是否启用 function 功能玩法。 | `false` |
+|  | `function_key` | Function 密钥 | Function 调用密钥（可选）。 | `""` |
 |  | `image_format` | 图片格式 | 生成的图片格式（url 或 base64）。 | `url` |
 |  | `video_format` | 视频格式 | 生成的视频格式（html 或 url，url 为处理后的链接）。 | `html` |
 |  | `temporary` | 临时对话 | 是否启用临时对话模式。 | `true` |
@@ -345,9 +410,12 @@ curl http://localhost:8000/v1/images/edits \
 |  | `stream` | 流式响应 | 是否默认启用流式输出。 | `true` |
 |  | `thinking` | 思维链 | 是否默认启用思维链输出。 | `true` |
 |  | `dynamic_statsig` | 动态指纹 | 是否动态生成 Statsig 指纹。 | `true` |
+|  | `custom_instruction` | 自定义指令 | 多行文本，透传为 Grok `customPersonality`。 | `""` |
 |  | `filter_tags` | 过滤标签 | 自动过滤 Grok 响应中的特殊标签。 | `["xaiartifact","xai:tool_usage_card","grok:render"]` |
 | **proxy** | `base_proxy_url` | 基础代理 URL | 代理请求到 Grok 官网的基础服务地址。 | `""` |
 |  | `asset_proxy_url` | 资源代理 URL | 代理请求到 Grok 官网的静态资源（图片/视频）地址。 | `""` |
+|  | `cf_cookies` | CF Cookies | FlareSolverr 刷新写入的完整 Cookie 字符串。 | `""` |
+|  | `skip_proxy_ssl_verify` | 跳过代理 SSL 校验 | 代理使用自签名证书时启用（仅放行代理证书，目标站点仍校验）。 | `false` |
 |  | `enabled` | CF 自动刷新 | 是否启用 CF 自动刷新。 | `false` |
 |  | `flaresolverr_url` | FlareSolverr 地址 | FlareSolverr 服务的 HTTP 地址。 | `""` |
 |  | `refresh_interval` | 刷新间隔 | 自动刷新 cf_clearance 间隔（秒）。 | `3600` |
@@ -357,6 +425,7 @@ curl http://localhost:8000/v1/images/edits \
 |  | `user_agent` | User-Agent | HTTP 请求的 User-Agent 字符串。 | `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36` |
 | **retry** | `max_retry` | 最大重试 | 请求 Grok 服务失败时的最大重试次数。 | `3` |
 |  | `retry_status_codes` | 重试状态码 | 触发重试的 HTTP 状态码列表。 | `[401, 429, 403]` |
+|  | `reset_session_status_codes` | 重建状态码 | 触发重建 session 的 HTTP 状态码列表（用于轮换代理）。 | `[403]` |
 |  | `retry_backoff_base` | 退避基数 | 重试退避的基础延迟（秒）。 | `0.5` |
 |  | `retry_backoff_factor` | 退避倍率 | 重试退避的指数放大系数。 | `2.0` |
 |  | `retry_backoff_max` | 退避上限 | 单次重试等待的最大延迟（秒）。 | `20.0` |
@@ -388,6 +457,7 @@ curl http://localhost:8000/v1/images/edits \
 | **video** | `concurrent` | 并发上限 | Reverse 接口并发上限。 | `100` |
 |  | `timeout` | 请求超时 | Reverse 接口超时时间（秒）。 | `60` |
 |  | `stream_timeout` | 流空闲超时 | 流式空闲超时时间（秒）。 | `60` |
+|  | `upscale_timing` | 超分时机 | Basic 号池 720p 超分模式：`single`（每轮扩展后超分）/ `complete`（所有扩展后超分）。 | `complete` |
 | **voice** | `timeout` | 请求超时 | Voice 请求超时时间（秒）。 | `60` |
 | **asset** | `upload_concurrent` | 上传并发 | 上传接口的最大并发数。 | `100` |
 |  | `upload_timeout` | 上传超时 | 上传接口超时时间（秒）。 | `60` |

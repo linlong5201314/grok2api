@@ -10,7 +10,7 @@ Token 数据模型
 
 from enum import Enum
 from typing import Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 
 
@@ -51,6 +51,10 @@ class TokenInfo(BaseModel):
     status: TokenStatus = TokenStatus.ACTIVE
     quota: int = BASIC__DEFAULT_QUOTA
 
+    # 消耗记录（本地累加，不依赖 API 返回值）
+    # 仅在 consumed_mode_enabled=true 时使用
+    consumed: int = 0
+
     # 统计
     created_at: int = Field(
         default_factory=lambda: int(datetime.now().timestamp() * 1000)
@@ -62,6 +66,10 @@ class TokenInfo(BaseModel):
     fail_count: int = 0
     last_fail_at: Optional[int] = None
     last_fail_reason: Optional[str] = None
+    upstream_fail_count: int = 0
+    last_upstream_fail_at: Optional[int] = None
+    last_upstream_fail_reason: Optional[str] = None
+    unavailable_until: Optional[int] = None
 
     # 冷却管理
     last_sync_at: Optional[int] = None  # 上次同步时间
@@ -71,41 +79,131 @@ class TokenInfo(BaseModel):
     note: str = ""
     last_asset_clear_at: Optional[int] = None
 
-    def is_available(self) -> bool:
-        """检查是否可用（状态正常且配额 > 0）"""
-        return self.status == TokenStatus.ACTIVE and self.quota > 0
+    @field_validator("token", mode="before")
+    @classmethod
+    def _normalize_token(cls, value):
+        """Normalize copied tokens to avoid unicode punctuation issues."""
+        if value is None:
+            raise ValueError("token cannot be empty")
+        token = str(value)
+        token = token.translate(
+            str.maketrans(
+                {
+                    "\u2010": "-",
+                    "\u2011": "-",
+                    "\u2012": "-",
+                    "\u2013": "-",
+                    "\u2014": "-",
+                    "\u2212": "-",
+                    "\u00a0": " ",
+                    "\u2007": " ",
+                    "\u202f": " ",
+                    "\u200b": "",
+                    "\u200c": "",
+                    "\u200d": "",
+                    "\ufeff": "",
+                }
+            )
+        )
+        token = "".join(token.split())
+        if token.startswith("sso="):
+            token = token[4:]
+        token = token.encode("ascii", errors="ignore").decode("ascii")
+        if not token:
+            raise ValueError("token cannot be empty")
+        return token
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(datetime.now().timestamp() * 1000)
+
+    def is_temporarily_unavailable(self, now_ms: Optional[int] = None) -> bool:
+        """检查临时不可用窗口，过期后自动恢复。"""
+        if not self.unavailable_until:
+            return False
+        current = self._now_ms() if now_ms is None else now_ms
+        if current >= self.unavailable_until:
+            self.unavailable_until = None
+            return False
+        return True
+
+    def is_available(self, consumed_mode: bool = False) -> bool:
+        """检查当前模式下 token 是否可用。"""
+        if self.status != TokenStatus.ACTIVE:
+            return False
+        if self.is_temporarily_unavailable():
+            return False
+        if consumed_mode:
+            return True
+        return self.quota > 0
+
+    def enter_cooling(self, reset_consumed: bool = True):
+        """进入冷却状态，并在新窗口开始时清空 consumed。"""
+        self.status = TokenStatus.COOLING
+        if reset_consumed:
+            self.consumed = 0
+
+    def recover_active(self, allow_from_expired: bool = False):
+        """仅在允许的前提下恢复为 active。"""
+        if self.status == TokenStatus.COOLING:
+            self.status = TokenStatus.ACTIVE
+        elif allow_from_expired and self.status == TokenStatus.EXPIRED:
+            self.status = TokenStatus.ACTIVE
 
     def consume(self, effort: EffortType = EffortType.LOW) -> int:
         """
-        消耗配额
+        消耗配额（默认：扣减 quota）
 
         Args:
-            effort: LOW 扣 1 配额并计 1 次，HIGH 扣 4 配额并计 4 次
+            effort: LOW 计 1 次，HIGH 计 4 次
 
         Returns:
             实际扣除的配额
         """
         cost = EFFORT_COST[effort]
+
+        # 默认行为：扣减 quota
         actual_cost = min(cost, self.quota)
 
-        self.last_used_at = int(datetime.now().timestamp() * 1000)
-        self.use_count += actual_cost  # 使用 actual_cost 避免配额不足时过度计数
+        self.last_used_at = self._now_ms()
+        self.consumed += cost  # 无论是否开启消耗模式，都记录消耗
+        self.use_count += actual_cost
         self.quota = max(0, self.quota - actual_cost)
 
-        # 注意：不在这里清零 fail_count，只有 record_success() 才清零
-        # 这样可以避免失败后调用 consume 导致失败计数被重置
-
+        # 默认行为：quota 耗尽时标记冷却，并重置消耗记录
         if self.quota == 0:
-            self.status = TokenStatus.COOLING
-        elif self.status == TokenStatus.COOLING:
-            # 只从 COOLING 恢复，不从 EXPIRED 恢复
-            self.status = TokenStatus.ACTIVE
+            self.enter_cooling()
+        else:
+            self.recover_active()
 
         return actual_cost
 
+    def consume_with_consumed(self, effort: EffortType = EffortType.LOW) -> int:
+        """
+        消耗配额（consumed 模式：累加 consumed 而非扣减 quota）
+
+        仅在 consumed_mode_enabled=true 时使用
+
+        Args:
+            effort: LOW 计 1 次，HIGH 计 4 次
+
+        Returns:
+            实际计入的消耗次数
+        """
+        cost = EFFORT_COST[effort]
+
+        self.consumed += cost  # 累加消耗记录
+        self.last_used_at = self._now_ms()
+        self.use_count += 1
+
+        # consumed 模式下不自动判断冷却，由 Rate Limits 检查或 429 触发
+        self.recover_active()
+
+        return cost
+
     def update_quota(self, new_quota: int):
         """
-        更新配额（用于 API 同步）
+        更新配额（用于 API 同步 - 默认模式）
 
         Args:
             new_quota: 新的配额值
@@ -113,12 +211,25 @@ class TokenInfo(BaseModel):
         self.quota = max(0, new_quota)
 
         if self.quota == 0:
-            self.status = TokenStatus.COOLING
-        elif self.quota > 0 and self.status in [
-            TokenStatus.COOLING,
-            TokenStatus.EXPIRED,
-        ]:
-            self.status = TokenStatus.ACTIVE
+            self.enter_cooling()
+        else:
+            self.recover_active(allow_from_expired=True)
+
+    def update_quota_with_consumed(self, new_quota: int):
+        """
+        更新配额（consumed 模式）
+
+        仅在 consumed_mode_enabled=true 时使用
+
+        Args:
+            new_quota: 新的配额值
+        """
+        self.quota = max(0, new_quota)
+
+        if self.quota == 0:
+            self.enter_cooling()
+        else:
+            self.recover_active()
 
     def reset(self, default_quota: Optional[int] = None):
         """重置配额到默认值"""
@@ -127,6 +238,13 @@ class TokenInfo(BaseModel):
         self.status = TokenStatus.ACTIVE
         self.fail_count = 0
         self.last_fail_reason = None
+        self.last_fail_at = None
+        self.upstream_fail_count = 0
+        self.last_upstream_fail_at = None
+        self.last_upstream_fail_reason = None
+        self.unavailable_until = None
+        # 重置消耗记录
+        self.consumed = 0
 
     def record_fail(
         self,
@@ -147,20 +265,48 @@ class TokenInfo(BaseModel):
         if self.fail_count >= limit:
             self.status = TokenStatus.EXPIRED
 
+    def record_upstream_fail(
+        self,
+        reason: str = "",
+        cooldown_sec: int = 600,
+        threshold: int = 3,
+    ) -> bool:
+        """
+        记录上游异常失败。
+
+        返回:
+            是否已达到阈值并永久禁用
+        """
+        now = self._now_ms()
+        self.upstream_fail_count += 1
+        self.last_upstream_fail_at = now
+        self.last_upstream_fail_reason = reason
+
+        if cooldown_sec > 0:
+            cooldown_ms = int(cooldown_sec * 1000)
+            until = now + cooldown_ms
+            self.unavailable_until = max(self.unavailable_until or 0, until)
+
+        if threshold > 0 and self.upstream_fail_count >= threshold:
+            self.status = TokenStatus.DISABLED
+            self.unavailable_until = None
+            return True
+
+        return False
+
     def record_success(self, is_usage: bool = True):
-        """记录成功，清空失败计数并根据配额更新状态"""
+        """记录成功，清空失败计数"""
         self.fail_count = 0
         self.last_fail_at = None
         self.last_fail_reason = None
+        self.upstream_fail_count = 0
+        self.last_upstream_fail_at = None
+        self.last_upstream_fail_reason = None
+        self.unavailable_until = None
 
         if is_usage:
             self.use_count += 1
-            self.last_used_at = int(datetime.now().timestamp() * 1000)
-
-        if self.quota == 0:
-            self.status = TokenStatus.COOLING
-        else:
-            self.status = TokenStatus.ACTIVE
+            self.last_used_at = self._now_ms()
 
     def need_refresh(self, interval_hours: int = 8) -> bool:
         """检查是否需要刷新配额"""
@@ -176,7 +322,23 @@ class TokenInfo(BaseModel):
 
     def mark_synced(self):
         """标记已同步"""
-        self.last_sync_at = int(datetime.now().timestamp() * 1000)
+        self.last_sync_at = self._now_ms()
+
+    def should_cool_down(self, remaining_tokens: int, threshold: int = 10) -> bool:
+        """
+        根据 Rate Limits 返回值判断是否应该冷却
+
+        Args:
+            remaining_tokens: API 返回的剩余配额
+            threshold: 冷却阈值，默认 10
+
+        Returns:
+            是否应该进入冷却状态
+        """
+        if remaining_tokens <= threshold:
+            self.status = TokenStatus.COOLING
+            return True
+        return False
 
 
 class TokenPoolStats(BaseModel):
@@ -189,6 +351,8 @@ class TokenPoolStats(BaseModel):
     cooling: int = 0
     total_quota: int = 0
     avg_quota: float = 0.0
+    total_consumed: int = 0
+    avg_consumed: float = 0.0
 
 
 __all__ = [
