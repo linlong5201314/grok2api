@@ -11,6 +11,11 @@ from app.core.logger import logger
 from app.core.storage import get_storage
 from app.services.grok.batch_services.usage import UsageService
 from app.services.grok.batch_services.nsfw import NSFWService
+from app.services.token.models import (
+    BASIC__DEFAULT_QUOTA,
+    SUPER_DEFAULT_QUOTA,
+    TokenInfo,
+)
 from app.services.token.manager import get_token_manager
 
 router = APIRouter()
@@ -43,6 +48,10 @@ def _sanitize_token_text(value) -> str:
     return token.encode("ascii", errors="ignore").decode("ascii")
 
 
+def _default_quota_for_pool(pool_name: str) -> int:
+    return SUPER_DEFAULT_QUOTA if pool_name == "ssoSuper" else BASIC__DEFAULT_QUOTA
+
+
 @router.get("/tokens", dependencies=[Depends(verify_app_key)])
 async def get_tokens():
     """获取所有 Token"""
@@ -56,6 +65,74 @@ async def get_tokens():
     return {
         "tokens": results or {},
         "consumed_mode_enabled": consumed_mode,
+    }
+
+
+@router.post("/tokens/import", dependencies=[Depends(verify_app_key)])
+async def import_tokens(data: dict):
+    """增量导入 Token，避免前端全量回传全部数据。"""
+    pool_name = str((data or {}).get("pool") or "ssoBasic").strip() or "ssoBasic"
+    raw_tokens = (data or {}).get("tokens")
+    if not isinstance(raw_tokens, list) or not raw_tokens:
+        raise HTTPException(status_code=400, detail="No tokens provided")
+
+    storage = get_storage()
+    updates: list[dict] = []
+    invalid_count = 0
+    duplicate_count = 0
+
+    async with storage.acquire_lock("tokens_save", timeout=10):
+        existing_data = await storage.load_tokens() or {}
+        existing_tokens = set()
+        for pool_tokens in existing_data.values():
+            if not isinstance(pool_tokens, list):
+                continue
+            for item in pool_tokens:
+                if isinstance(item, str):
+                    token_value = item
+                elif isinstance(item, dict):
+                    token_value = item.get("token")
+                else:
+                    token_value = None
+                token_key = _sanitize_token_text(token_value)
+                if token_key:
+                    existing_tokens.add(token_key)
+
+        seen_tokens = set()
+        default_quota = _default_quota_for_pool(pool_name)
+        for raw_token in raw_tokens:
+            token_key = _sanitize_token_text(raw_token)
+            if not token_key:
+                invalid_count += 1
+                continue
+            if token_key in existing_tokens or token_key in seen_tokens:
+                duplicate_count += 1
+                continue
+
+            info = TokenInfo(token=token_key, quota=default_quota)
+            payload = info.model_dump()
+            payload["pool_name"] = pool_name
+            payload["_update_kind"] = "state"
+            updates.append(payload)
+            seen_tokens.add(token_key)
+            existing_tokens.add(token_key)
+
+        if updates:
+            await storage.save_tokens_delta(updates, [])
+
+    if updates:
+        mgr = await get_token_manager()
+        await mgr.reload()
+
+    return {
+        "status": "success",
+        "summary": {
+            "requested": len(raw_tokens),
+            "imported": len(updates),
+            "duplicated": duplicate_count,
+            "invalid": invalid_count,
+            "pool": pool_name,
+        },
     }
 
 

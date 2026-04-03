@@ -13,11 +13,145 @@ let currentBatchTaskId = null;
 let batchEventSource = null;
 let currentPage = 1;
 let pageSize = 50;
+let selectedTokenKeys = new Set();
+let selectedCount = 0;
+let isSelectionApplying = false;
+let isImporting = false;
+let batchAbortRequested = false;
 
 const byId = (id) => document.getElementById(id);
 const qsa = (selector) => document.querySelectorAll(selector);
 const DEFAULT_QUOTA_BASIC = 80;
 const DEFAULT_QUOTA_SUPER = 140;
+const IMPORT_CHUNK_SIZE = 200;
+const NSFW_CHUNK_SIZE = 25;
+const SELECTION_CHUNK_SIZE = 300;
+const SELECTION_YIELD_THRESHOLD = 400;
+
+function getTokenKey(item) {
+  return `${item.pool}::${item.token}`;
+}
+
+function resetSelectionState() {
+  selectedTokenKeys.clear();
+  selectedCount = 0;
+  isSelectionApplying = false;
+}
+
+function rebuildSelectionState() {
+  selectedTokenKeys.clear();
+  selectedCount = 0;
+  flatTokens.forEach(item => {
+    if (!item._selected) return;
+    const key = getTokenKey(item);
+    if (!selectedTokenKeys.has(key)) {
+      selectedTokenKeys.add(key);
+      selectedCount += 1;
+    }
+  });
+}
+
+function setTokenSelected(item, selected) {
+  const key = getTokenKey(item);
+  if (selected) {
+    item._selected = true;
+    if (!selectedTokenKeys.has(key)) {
+      selectedTokenKeys.add(key);
+      selectedCount += 1;
+    }
+    return;
+  }
+
+  item._selected = false;
+  if (selectedTokenKeys.delete(key) && selectedCount > 0) {
+    selectedCount -= 1;
+  }
+}
+
+function normalizeImportToken(value) {
+  const token = String(value || '').trim().replace(/^sso=/, '');
+  return token.replace(/\s+/g, '');
+}
+
+async function yieldToMainThread() {
+  return new Promise(resolve => {
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => setTimeout(resolve, 0));
+      return;
+    }
+    setTimeout(resolve, 0);
+  });
+}
+
+async function applySelection(tokens, selected) {
+  if (isSelectionApplying) return false;
+  isSelectionApplying = true;
+  setActionButtonsState();
+
+  try {
+    for (let i = 0; i < tokens.length; i += SELECTION_CHUNK_SIZE) {
+      const chunk = tokens.slice(i, i + SELECTION_CHUNK_SIZE);
+      setSelectedForTokens(chunk, selected);
+      if (tokens.length > SELECTION_YIELD_THRESHOLD && i + SELECTION_CHUNK_SIZE < tokens.length) {
+        await yieldToMainThread();
+      }
+    }
+    return true;
+  } finally {
+    isSelectionApplying = false;
+    setActionButtonsState();
+  }
+}
+
+function syncVisibleSelectionUIFromState() {
+  const visibleTokens = getVisibleTokens();
+  qsa('#token-table-body input[type="checkbox"]').forEach((input, index) => {
+    input.checked = !!(visibleTokens[index] && visibleTokens[index]._selected);
+  });
+  qsa('#token-table-body tr').forEach((row, index) => {
+    row.classList.toggle('row-selected', !!(visibleTokens[index] && visibleTokens[index]._selected));
+  });
+}
+
+async function postJson(url, payload) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...buildAuthHeaders(apiKey)
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await readJsonResponse(res);
+  if (!res.ok) {
+    const detail = data && (data.detail || data.message);
+    throw new Error(detail || `HTTP ${res.status}`);
+  }
+  if (!data) {
+    throw new Error(t('token.emptyResponse', { status: res.status }));
+  }
+  if (data.status && data.status !== 'success') {
+    throw new Error(data.detail || data.message || t('common.requestFailed'));
+  }
+
+  return data;
+}
+
+function setImportSubmitState(submitting, current = 0, total = 0) {
+  const btn = byId('btn-import-submit');
+  if (!btn) return;
+
+  btn.disabled = submitting;
+  if (submitting) {
+    btn.dataset.i18n = '';
+    btn.textContent = t('token.importProgress', { current, total });
+    return;
+  }
+
+  btn.dataset.i18n = 'token.startImport';
+  btn.textContent = t('token.startImport');
+}
 
 function getDefaultQuotaForPool(pool) {
   return pool === 'ssoSuper' ? DEFAULT_QUOTA_SUPER : DEFAULT_QUOTA_BASIC;
@@ -84,7 +218,7 @@ function countSelected(tokens) {
 
 function setSelectedForTokens(tokens, selected) {
   tokens.forEach(t => {
-    t._selected = selected;
+    setTokenSelected(t, selected);
   });
 }
 
@@ -143,6 +277,7 @@ async function loadData() {
 // Convert pool dict to flattened array
 function processTokens(data) {
   flatTokens = [];
+  resetSelectionState();
   Object.keys(data).forEach(pool => {
     const tokens = data[pool];
     if (Array.isArray(tokens)) {
@@ -384,6 +519,7 @@ function renderTable() {
 
 // Selection Logic
 function toggleSelectAll() {
+  if (isSelectionApplying) return;
   const checkbox = byId('select-all');
   const checked = !!(checkbox && checkbox.checked);
   // 只选择当前页可见的 Token
@@ -423,7 +559,8 @@ function setupSelectAllMenu() {
 
 function handleSelectAllPrimary(event) {
   if (event) event.stopPropagation();
-  const selected = countSelected(flatTokens);
+  if (isSelectionApplying) return;
+  const selected = selectedCount;
   if (selected > 0) {
     clearAllSelection();
     return;
@@ -445,10 +582,11 @@ function selectAllFilteredFromMenu() {
   closeSelectAllMenu();
 }
 
-function selectAllFiltered() {
+async function selectAllFiltered() {
   const filtered = getFilteredTokens();
   if (filtered.length === 0) return;
-  setSelectedForTokens(filtered, true);
+  const changed = await applySelection(filtered, true);
+  if (!changed) return;
   syncVisibleSelectionUI(true);
   updateSelectionState();
   closeSelectAllMenu();
@@ -463,34 +601,37 @@ function selectVisibleAll() {
   closeSelectAllMenu();
 }
 
-function clearAllSelection() {
+async function clearAllSelection() {
   if (flatTokens.length === 0) return;
-  setSelectedForTokens(flatTokens, false);
+  const changed = await applySelection(flatTokens, false);
+  if (!changed) return;
   syncVisibleSelectionUI(false);
   updateSelectionState();
   closeSelectAllMenu();
 }
 
 function toggleSelect(index) {
-  flatTokens[index]._selected = !flatTokens[index]._selected;
+  if (isSelectionApplying) return;
+  const item = flatTokens[index];
+  if (!item) return;
+  setTokenSelected(item, !item._selected);
   const row = document.querySelector(`#token-table-body tr[data-index="${index}"]`);
-  if (row) row.classList.toggle('row-selected', flatTokens[index]._selected);
+  if (row) row.classList.toggle('row-selected', item._selected);
   updateSelectionState();
 }
 
 function updateSelectionState() {
-  const selectedCount = countSelected(flatTokens);
   const visible = getVisibleTokens();
   const visibleSelected = countSelected(visible);
   const selectAll = byId('select-all');
   if (selectAll) {
     const hasVisible = visible.length > 0;
-    selectAll.disabled = !hasVisible;
+    selectAll.disabled = isSelectionApplying || !hasVisible;
     selectAll.checked = hasVisible && visibleSelected === visible.length;
     selectAll.indeterminate = visibleSelected > 0 && visibleSelected < visible.length;
   }
   const selectedCountEl = byId('selected-count');
-  if (selectedCountEl) selectedCountEl.innerText = selectedCount;
+  if (selectedCountEl) selectedCountEl.innerText = selectedCount.toLocaleString();
   const selectAllLabel = byId('select-all-label');
   const selectAllTrigger = byId('select-all-trigger');
   const selectAllCaret = byId('select-all-caret');
@@ -660,6 +801,7 @@ async function deleteToken(index) {
   const ok = await confirmAction(t('token.confirmDelete'), { okText: t('common.delete') });
   if (!ok) return;
   flatTokens.splice(index, 1);
+  rebuildSelectionState();
   syncToServer().then(loadData);
 }
 
@@ -772,6 +914,7 @@ function openImportModal() {
 }
 
 function closeImportModal() {
+  if (isImporting) return;
   closeModal('import-modal', () => {
     const input = byId('import-text');
     if (input) input.value = '';
@@ -779,32 +922,85 @@ function closeImportModal() {
 }
 
 async function submitImport() {
+  if (isImporting) return;
   const pool = byId('import-pool').value.trim() || 'ssoBasic';
-  const text = byId('import-text').value;
-  const lines = text.split('\n');
-  const defaultQuota = getDefaultQuotaForPool(pool);
+  const text = byId('import-text').value || '';
+  const existingTokens = new Set(flatTokens.map(item => item.token));
+  const seenTokens = new Set();
+  const tokens = [];
+  let duplicated = 0;
+  let invalid = 0;
 
-  lines.forEach(line => {
-    const t = line.trim();
-    if (t && !flatTokens.some(ft => ft.token === t)) {
-      flatTokens.push({
-        token: t,
-        pool: pool,
-        status: 'active',
-        quota: defaultQuota,
-        consumed: 0,
-        note: '',
-        tags: [],
-        fail_count: 0,
-        use_count: 0,
-        _selected: false
-      });
+  text.split(/\r?\n/).forEach(line => {
+    const raw = String(line || '').trim();
+    if (!raw) return;
+
+    const token = normalizeImportToken(raw);
+    if (!token) {
+      invalid += 1;
+      return;
     }
+    if (existingTokens.has(token) || seenTokens.has(token)) {
+      duplicated += 1;
+      return;
+    }
+
+    seenTokens.add(token);
+    tokens.push(token);
   });
 
-  await syncToServer();
-  closeImportModal();
-  loadData();
+  if (tokens.length === 0) {
+    const level = duplicated > 0 || invalid > 0 ? 'info' : 'error';
+    const message = duplicated > 0 || invalid > 0
+      ? t('token.importResult', { imported: 0, duplicated, invalid })
+      : t('token.importNothingToAdd');
+    showToast(message, level);
+    return;
+  }
+
+  let imported = 0;
+  let serverDuplicated = 0;
+  let serverInvalid = 0;
+  isImporting = true;
+  setImportSubmitState(true, 0, tokens.length);
+  setActionButtonsState();
+
+  try {
+    for (let i = 0; i < tokens.length; i += IMPORT_CHUNK_SIZE) {
+      const chunk = tokens.slice(i, i + IMPORT_CHUNK_SIZE);
+      const data = await postJson('/v1/admin/tokens/import', { pool, tokens: chunk });
+      const summary = data.summary || {};
+      imported += Number(summary.imported || 0);
+      serverDuplicated += Number(summary.duplicated || 0);
+      serverInvalid += Number(summary.invalid || 0);
+      setImportSubmitState(true, Math.min(tokens.length, i + chunk.length), tokens.length);
+      if (i + IMPORT_CHUNK_SIZE < tokens.length) {
+        await yieldToMainThread();
+      }
+    }
+
+    isImporting = false;
+    setImportSubmitState(false);
+    closeImportModal();
+    await loadData();
+    showToast(
+      t('token.importResult', {
+        imported,
+        duplicated: duplicated + serverDuplicated,
+        invalid: invalid + serverInvalid
+      }),
+      imported > 0 ? 'success' : 'info'
+    );
+  } catch (e) {
+    if (imported > 0) {
+      await loadData();
+    }
+    showToast(t('token.requestError') + ': ' + e.message, 'error');
+  } finally {
+    isImporting = false;
+    setImportSubmitState(false);
+    setActionButtonsState();
+  }
 }
 
 // Export Logic
@@ -960,6 +1156,10 @@ function toggleBatchPause() {
 
 function stopBatchRefresh() {
   if (!isBatchProcessing) return;
+  if (currentBatchAction === 'nsfw' && !currentBatchTaskId) {
+    batchAbortRequested = true;
+    return;
+  }
   if (currentBatchTaskId) {
     BatchSSE.cancel(currentBatchTaskId, apiKey);
     BatchSSE.close(batchEventSource);
@@ -973,6 +1173,7 @@ function finishBatchProcess(aborted = false, options = {}) {
   const action = currentBatchAction;
   isBatchProcessing = false;
   isBatchPaused = false;
+  batchAbortRequested = false;
   batchQueue = [];
   currentBatchAction = null;
 
@@ -1026,12 +1227,12 @@ function updateBatchProgress() {
   if (stopBtn) stopBtn.classList.remove('hidden');
 }
 
-function setActionButtonsState(selectedCount = null) {
-  let count = selectedCount;
+function setActionButtonsState(selectedCountValue = null) {
+  let count = selectedCountValue;
   if (count === null) {
-    count = countSelected(flatTokens);
+    count = selectedCount;
   }
-  const disabled = isBatchProcessing;
+  const disabled = isBatchProcessing || isSelectionApplying || isImporting;
   const exportBtn = byId('btn-batch-export');
   const updateBtn = byId('btn-batch-update');
   const disableBtn = byId('btn-batch-disable');
@@ -1069,6 +1270,7 @@ async function startBatchDelete() {
   try {
     const toRemove = new Set(batchQueue);
     flatTokens = flatTokens.filter(t => !toRemove.has(t.token));
+    rebuildSelectionState();
     await syncToServer();
     batchProcessed = batchTotal;
     updateBatchProgress();
@@ -1269,86 +1471,42 @@ async function batchEnableNSFW() {
 
   isBatchProcessing = true;
   currentBatchAction = 'nsfw';
+  batchAbortRequested = false;
   batchTotal = targetCount;
   batchProcessed = 0;
   updateBatchProgress();
   setActionButtonsState();
 
   try {
-    const tokens = selected.length > 0 ? selected.map(t => t.token) : null;
-    const res = await fetch('/v1/admin/tokens/nsfw/enable/async', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...buildAuthHeaders(apiKey)
-      },
-      body: JSON.stringify({ tokens })
-    });
+    const tokens = selected.map(t => t.token);
+    let okCount = 0;
+    let failCount = 0;
 
-    const data = await readJsonResponse(res);
-    if (!res.ok) {
-      const detail = data && (data.detail || data.message);
-      throw new Error(detail || `HTTP ${res.status}`);
-    }
-    if (!data) {
-      throw new Error(t('token.emptyResponse', { status: res.status }));
-    }
-    if (data.status !== 'success') {
-      throw new Error(data.detail || t('common.requestFailed'));
-    }
-
-    currentBatchTaskId = data.task_id;
-    BatchSSE.close(batchEventSource);
-    batchEventSource = BatchSSE.open(currentBatchTaskId, apiKey, {
-      onMessage: (msg) => {
-        if (msg.type === 'snapshot' || msg.type === 'progress') {
-          if (typeof msg.total === 'number') batchTotal = msg.total;
-          if (typeof msg.processed === 'number') batchProcessed = msg.processed;
-          updateBatchProgress();
-        } else if (msg.type === 'done') {
-          if (typeof msg.total === 'number') batchTotal = msg.total;
-          batchProcessed = batchTotal;
-          updateBatchProgress();
-          finishBatchProcess(false, { silent: true });
-          const summary = msg.result && msg.result.summary ? msg.result.summary : null;
-          const okCount = summary ? summary.ok : 0;
-          const failCount = summary ? summary.fail : 0;
-          let text = t('token.nsfwResult', { ok: okCount, fail: failCount });
-          if (msg.warning) text += `\n⚠️ ${msg.warning}`;
-          showToast(text, failCount > 0 || msg.warning ? 'warning' : 'success');
-          currentBatchTaskId = null;
-          BatchSSE.close(batchEventSource);
-          batchEventSource = null;
-          if (btn) btn.disabled = false;
-          setActionButtonsState();
-        } else if (msg.type === 'cancelled') {
-          finishBatchProcess(true, { silent: true });
-          showToast(t('token.stopNsfw'), 'info');
-          currentBatchTaskId = null;
-          BatchSSE.close(batchEventSource);
-          batchEventSource = null;
-          if (btn) btn.disabled = false;
-          setActionButtonsState();
-        } else if (msg.type === 'error') {
-          finishBatchProcess(true, { silent: true });
-          showToast(t('token.nsfwFailed', { msg: msg.error || t('common.unknownError') }), 'error');
-          currentBatchTaskId = null;
-          BatchSSE.close(batchEventSource);
-          batchEventSource = null;
-          if (btn) btn.disabled = false;
-          setActionButtonsState();
-        }
-      },
-      onError: () => {
+    for (let i = 0; i < tokens.length; i += NSFW_CHUNK_SIZE) {
+      if (batchAbortRequested) {
         finishBatchProcess(true, { silent: true });
-        showToast(t('common.connectionInterrupted'), 'error');
-        currentBatchTaskId = null;
-        BatchSSE.close(batchEventSource);
-        batchEventSource = null;
-        if (btn) btn.disabled = false;
-        setActionButtonsState();
+        showToast(t('token.stopNsfw'), 'info');
+        return;
       }
-    });
+
+      const chunk = tokens.slice(i, i + NSFW_CHUNK_SIZE);
+      const data = await postJson('/v1/admin/tokens/nsfw/enable', { tokens: chunk });
+      const summary = data.summary || {};
+      okCount += Number(summary.ok || 0);
+      failCount += Number(summary.fail || 0);
+      batchProcessed = Math.min(batchTotal, i + chunk.length);
+      updateBatchProgress();
+
+      if (i + NSFW_CHUNK_SIZE < tokens.length) {
+        await yieldToMainThread();
+      }
+    }
+
+    finishBatchProcess(false, { silent: true });
+    showToast(
+      t('token.nsfwResult', { ok: okCount, fail: failCount }),
+      failCount > 0 ? 'warning' : 'success'
+    );
   } catch (e) {
     finishBatchProcess(true, { silent: true });
     showToast(t('token.requestError') + ': ' + e.message, 'error');
