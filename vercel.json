@@ -2,9 +2,11 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "fastapi",
   "functions": {
-    "main.py": {
-      "includeFiles": "app/**"
+    "api/index.py": {
+      "includeFiles": [
+        "app/**",
+        "config.defaults.toml"
+      ]
     }
   }
 }
-
