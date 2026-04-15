@@ -146,7 +146,19 @@ def _add_file_sink(
     global _file_sink_id
 
     _dir = log_dir or get_log_dir()
-    _dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # Serverless runtimes may expose a read-only code filesystem.
+        # Do not fail startup when file logging cannot be initialised.
+        logger.warning(
+            "file logging disabled: cannot create log dir '{}' (error={})",
+            _dir,
+            exc,
+        )
+        _file_sink_id = None
+        return
+
     _file_sink_id = logger.add(
         str(_dir / "app_{time:YYYY-MM-DD}.log"),
         level=file_level,
