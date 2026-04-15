@@ -34,6 +34,18 @@ def _get_env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _default_file_logging_enabled() -> bool:
+    # Serverless filesystems are often read-only outside /tmp.
+    # Keep file logging opt-in there unless LOG_FILE_ENABLED is set explicitly.
+    if (
+        os.getenv("VERCEL")
+        or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+        or os.getenv("FUNCTIONS_WORKER_RUNTIME")
+    ):
+        return False
+    return True
+
+
 def setup_logging(
     *,
     level: str = "INFO",
@@ -88,7 +100,7 @@ def reload_logging(
 ) -> None:
     """Re-configure logging from runtime values (called after config loads)."""
     resolved_level = (level or "").strip() or os.getenv("LOG_LEVEL", default_level)
-    file_logging = _get_env_bool("LOG_FILE_ENABLED", True)
+    file_logging = _get_env_bool("LOG_FILE_ENABLED", _default_file_logging_enabled())
     setup_logging(
         level=resolved_level,
         file_level=file_level or resolved_level,
@@ -114,7 +126,7 @@ def reload_file_logging(
         logger.remove(_file_sink_id)
         _file_sink_id = None
 
-    _file_logging = _get_env_bool("LOG_FILE_ENABLED", True)
+    _file_logging = _get_env_bool("LOG_FILE_ENABLED", _default_file_logging_enabled())
     if not _file_logging:
         return
 

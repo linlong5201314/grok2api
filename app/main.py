@@ -83,9 +83,19 @@ def _release_scheduler_lock() -> None:
 # Early logging setup (before config is loaded)
 # ---------------------------------------------------------------------------
 
+_DEFAULT_LOG_FILE_ENABLED = (
+    "false"
+    if (
+        os.getenv("VERCEL")
+        or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+        or os.getenv("FUNCTIONS_WORKER_RUNTIME")
+    )
+    else "true"
+)
+
 setup_logging(
     level=os.getenv("LOG_LEVEL", "INFO"),
-    file_logging=os.getenv("LOG_FILE_ENABLED", "true").strip().lower()
+    file_logging=os.getenv("LOG_FILE_ENABLED", _DEFAULT_LOG_FILE_ENABLED).strip().lower()
     in {"1", "true", "yes", "on"},
 )
 

@@ -15,12 +15,22 @@ def _resolve_env_path(name: str, default: str) -> Path:
     return path
 
 
+def _is_serverless_runtime() -> bool:
+    return bool(
+        os.getenv("VERCEL")
+        or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+        or os.getenv("FUNCTIONS_WORKER_RUNTIME")
+    )
+
+
 def data_dir() -> Path:
-    return _resolve_env_path("DATA_DIR", "data")
+    default = "/tmp/data" if _is_serverless_runtime() else "data"
+    return _resolve_env_path("DATA_DIR", default)
 
 
 def log_dir() -> Path:
-    return _resolve_env_path("LOG_DIR", "logs")
+    default = "/tmp/logs" if _is_serverless_runtime() else "logs"
+    return _resolve_env_path("LOG_DIR", default)
 
 
 def data_path(*parts: str) -> Path:
