@@ -3,10 +3,7 @@
   "framework": "fastapi",
   "functions": {
     "api/index.py": {
-      "includeFiles": [
-        "app/**",
-        "config.defaults.toml"
-      ]
+      "includeFiles": "{app/**,config.defaults.toml}"
     }
   }
 }
