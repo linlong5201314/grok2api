@@ -3,7 +3,6 @@
 import os
 from pathlib import Path
 
-from app.control.account.backends.factory import get_repository_backend
 from app.platform.paths import data_path
 from .base import ConfigBackend
 
@@ -17,12 +16,21 @@ _BACKEND_ALIASES = {
 
 def get_config_backend_name() -> str:
     """Return the active config backend name (mirrors ACCOUNT_STORAGE)."""
-    return get_repository_backend()
+    return _normalize_backend(_get_backend_env())
 
 
 def _normalize_backend(raw: str) -> str:
     val = str(raw or "").strip().lower()
     return _BACKEND_ALIASES.get(val, val)
+
+
+def _get_backend_env() -> str:
+    # Backward compatibility: legacy deployments used SERVER_STORAGE_TYPE.
+    return (
+        os.getenv("ACCOUNT_STORAGE", "").strip()
+        or os.getenv("SERVER_STORAGE_TYPE", "").strip()
+        or "local"
+    )
 
 
 def _legacy_storage_url_for(expected_backend: str) -> str:
