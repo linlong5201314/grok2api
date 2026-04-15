@@ -30,6 +30,7 @@ class SqlEngineFactoryTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
+                "VERCEL": "1",
                 "ACCOUNT_SQL_POOL_SIZE": "2",
                 "ACCOUNT_SQL_MAX_OVERFLOW": "1",
                 "ACCOUNT_SQL_POOL_TIMEOUT": "15",
@@ -49,13 +50,40 @@ class SqlEngineFactoryTests(unittest.TestCase):
             args[0],
             "postgresql+asyncpg://user:pass@example.com:5432/defaultdb?application_name=grok2api",
         )
-        self.assertEqual(kwargs["connect_args"], {"ssl": "require"})
+        self.assertIsInstance(kwargs["connect_args"]["ssl"], ssl.SSLContext)
+        self.assertEqual(kwargs["connect_args"]["statement_cache_size"], 0)
         self.assertEqual(kwargs["pool_size"], 2)
         self.assertEqual(kwargs["max_overflow"], 1)
         self.assertEqual(kwargs["pool_timeout"], 15)
         self.assertEqual(kwargs["pool_recycle"], 600)
         self.assertTrue(kwargs["pool_pre_ping"])
         self.assertTrue(kwargs["pool_use_lifo"])
+
+    def test_create_pgsql_engine_disables_statement_cache_for_supabase_pooler(self) -> None:
+        sentinel = object()
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(sql_backend, "create_async_engine", return_value=sentinel) as create_engine:
+                engine = sql_backend.create_pgsql_engine(
+                    "postgresql://user:pass@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres"
+                )
+
+        self.assertIs(engine, sentinel)
+        create_engine.assert_called_once()
+        _, kwargs = create_engine.call_args
+        self.assertEqual(kwargs["connect_args"]["statement_cache_size"], 0)
+
+    def test_create_pgsql_engine_statement_cache_size_can_be_overridden(self) -> None:
+        sentinel = object()
+        with patch.dict(os.environ, {"VERCEL": "1", "ACCOUNT_SQL_STATEMENT_CACHE_SIZE": "32"}, clear=False):
+            with patch.object(sql_backend, "create_async_engine", return_value=sentinel) as create_engine:
+                engine = sql_backend.create_pgsql_engine(
+                    "postgres://user:pass@example.com:5432/defaultdb?sslmode=require"
+                )
+
+        self.assertIs(engine, sentinel)
+        create_engine.assert_called_once()
+        _, kwargs = create_engine.call_args
+        self.assertEqual(kwargs["connect_args"]["statement_cache_size"], 32)
 
     def test_create_mysql_engine_moves_ssl_mode_to_ssl_context(self) -> None:
         sentinel = object()

@@ -175,6 +175,17 @@ def _get_env_int(name: str, default: int, *, minimum: int = 0) -> int:
         return default
 
 
+def _get_env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "")
+    try:
+        parsed = _parse_ssl_bool(name, raw)
+    except ValueError:
+        return default
+    if parsed is None:
+        return default
+    return parsed
+
+
 def _normalize_ssl_mode(dialect: str, raw_mode: str) -> str:
     if not raw_mode:
         raise ValueError("SSL mode cannot be empty")
@@ -321,22 +332,56 @@ def _build_mysql_ssl_context(mode: str, ssl_options: dict[str, str]) -> ssl.SSLC
 
 def _build_sql_connect_args(
     dialect: str,
+    normalized_url: str,
     ssl_options: dict[str, str],
 ) -> dict[str, Any] | None:
+    connect_args: dict[str, Any] = {}
     mode = _resolve_ssl_mode(dialect, ssl_options)
-    if not mode:
-        return None
 
     if dialect == "mysql":
+        if not mode:
+            return None
         ctx = _build_mysql_ssl_context(mode, ssl_options)
         return {"ssl": ctx} if ctx is not None else None
 
-    _validate_pg_ssl_options(mode, ssl_options)
-    if mode == "disable":
-        return None
-    # asyncpg does not accept ssl= as a plain string (e.g. "require").
-    # Always build a proper ssl.SSLContext so the driver can use it directly.
-    return {"ssl": _build_pg_ssl_context(mode, ssl_options)}
+    if mode:
+        _validate_pg_ssl_options(mode, ssl_options)
+        if mode != "disable":
+            # asyncpg does not accept ssl= as a plain string (e.g. "require").
+            # Always build a proper ssl.SSLContext so the driver can use it directly.
+            connect_args["ssl"] = _build_pg_ssl_context(mode, ssl_options)
+
+    statement_cache_size = _resolve_pg_statement_cache_size(normalized_url)
+    if statement_cache_size is not None:
+        connect_args["statement_cache_size"] = statement_cache_size
+    return connect_args or None
+
+
+def _looks_like_supabase_pooler(normalized_url: str) -> bool:
+    parsed = urlparse(normalized_url)
+    host = (parsed.hostname or "").lower()
+    return parsed.port == 6543 or host.endswith("pooler.supabase.com")
+
+
+def _should_default_pg_statement_cache_zero(normalized_url: str) -> bool:
+    if _looks_like_supabase_pooler(normalized_url):
+        return True
+    return _is_serverless()
+
+
+def _resolve_pg_statement_cache_size(normalized_url: str) -> int | None:
+    raw = os.getenv("ACCOUNT_SQL_STATEMENT_CACHE_SIZE", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+
+    if _get_env_bool("ACCOUNT_SQL_DISABLE_STATEMENT_CACHE", False):
+        return 0
+    if _should_default_pg_statement_cache_zero(normalized_url):
+        return 0
+    return None
 
 
 def _prepare_sql_url_and_connect_args(
@@ -349,7 +394,7 @@ def _prepare_sql_url_and_connect_args(
         return normalized_url, None
 
     cleaned_url, ssl_options = _extract_sql_ssl_options(dialect, normalized_url)
-    return cleaned_url, _build_sql_connect_args(dialect, ssl_options)
+    return cleaned_url, _build_sql_connect_args(dialect, cleaned_url, ssl_options)
 
 
 def _is_serverless() -> bool:
@@ -791,7 +836,18 @@ class SqlAccountRepository:
 
 def _engine_cache_key(dialect: str, normalized_url: str, connect_args: dict[str, Any] | None) -> tuple[str, str, str]:
     """Build a stable cache key from the normalized URL and connect args."""
-    args_key = str(sorted(connect_args.items(), key=lambda kv: kv[0])) if connect_args else ""
+    if not connect_args:
+        return (dialect, normalized_url, "")
+
+    normalized_items: list[tuple[str, Any]] = []
+    for key, value in sorted(connect_args.items(), key=lambda kv: kv[0]):
+        if isinstance(value, ssl.SSLContext):
+            normalized_items.append(
+                (key, ("SSLContext", int(value.verify_mode), bool(value.check_hostname)))
+            )
+        else:
+            normalized_items.append((key, value))
+    args_key = str(normalized_items)
     return (dialect, normalized_url, args_key)
 
 
