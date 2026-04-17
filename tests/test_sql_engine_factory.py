@@ -52,6 +52,7 @@ class SqlEngineFactoryTests(unittest.TestCase):
         )
         self.assertIsInstance(kwargs["connect_args"]["ssl"], ssl.SSLContext)
         self.assertEqual(kwargs["connect_args"]["statement_cache_size"], 0)
+        self.assertEqual(kwargs["connect_args"]["prepared_statement_name_cache_size"], 0)
         self.assertEqual(kwargs["pool_size"], 2)
         self.assertEqual(kwargs["max_overflow"], 1)
         self.assertEqual(kwargs["pool_timeout"], 15)
@@ -71,6 +72,7 @@ class SqlEngineFactoryTests(unittest.TestCase):
         create_engine.assert_called_once()
         _, kwargs = create_engine.call_args
         self.assertEqual(kwargs["connect_args"]["statement_cache_size"], 0)
+        self.assertEqual(kwargs["connect_args"]["prepared_statement_name_cache_size"], 0)
 
     def test_create_pgsql_engine_statement_cache_size_can_be_overridden(self) -> None:
         sentinel = object()
