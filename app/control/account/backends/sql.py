@@ -354,8 +354,6 @@ def _build_sql_connect_args(
     statement_cache_size = _resolve_pg_statement_cache_size(normalized_url)
     if statement_cache_size is not None:
         connect_args["statement_cache_size"] = statement_cache_size
-        if statement_cache_size == 0:
-            connect_args["prepared_statement_name_cache_size"] = 0
     return connect_args or None
 
 
@@ -422,6 +420,8 @@ def _sql_engine_kwargs(connect_args: dict[str, Any] | None) -> dict[str, Any]:
     }
     if connect_args:
         kwargs["connect_args"] = connect_args
+        if connect_args.get("statement_cache_size") == 0:
+            kwargs["prepared_statement_cache_size"] = 0
     return kwargs
 
 
