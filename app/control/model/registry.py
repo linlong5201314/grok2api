@@ -35,6 +35,7 @@ MODELS: tuple[ModelSpec, ...] = (
     ModelSpec("grok-3-mini",                           ModeId.FAST,   Tier.BASIC, Capability.CHAT,       True, "Grok 3 Mini",             prefer_best=True),
     ModelSpec("grok-3-thinking",                       ModeId.EXPERT, Tier.BASIC, Capability.CHAT,       True, "Grok 3 Thinking",         prefer_best=True),
     ModelSpec("grok-4",                                ModeId.AUTO,   Tier.BASIC, Capability.CHAT,       True, "Grok 4",                  prefer_best=True),
+    ModelSpec("grok-4-mini",                           ModeId.FAST,   Tier.BASIC, Capability.CHAT,       True, "Grok 4 Mini",             prefer_best=True),
     ModelSpec("grok-4-thinking",                       ModeId.EXPERT, Tier.BASIC, Capability.CHAT,       True, "Grok 4 Thinking",         prefer_best=True),
     ModelSpec("grok-4.1-expert",                       ModeId.EXPERT, Tier.BASIC, Capability.CHAT,       True, "Grok 4.1 Expert",         prefer_best=True),
     ModelSpec("grok-4.1-fast",                         ModeId.FAST,   Tier.BASIC, Capability.CHAT,       True, "Grok 4.1 Fast",           prefer_best=True),

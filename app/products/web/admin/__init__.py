@@ -244,4 +244,17 @@ async def force_sync():
     )
 
 
-__all__ = ["router", "get_repo", "get_refresh_svc"]
+compat_router = APIRouter(prefix="/api/v1/admin", dependencies=[Depends(verify_admin_key)])
+compat_router.include_router(_tokens_router)
+compat_router.include_router(_batch_router)
+compat_router.include_router(_assets_router)
+compat_router.include_router(_cache_router)
+compat_router.add_api_route("/verify", admin_verify, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
+compat_router.add_api_route("/config", get_config_endpoint, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
+compat_router.add_api_route("/config", update_config, methods=["POST"], tags=[_TAG_ADMIN_SYSTEM])
+compat_router.add_api_route("/storage", get_storage_mode, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
+compat_router.add_api_route("/status", runtime_status, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
+compat_router.add_api_route("/sync", force_sync, methods=["POST"], tags=[_TAG_ADMIN_SYSTEM])
+
+
+__all__ = ["router", "compat_router", "get_repo", "get_refresh_svc"]

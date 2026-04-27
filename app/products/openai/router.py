@@ -131,6 +131,20 @@ _USER_BLOCK_TYPES = {"text", "image_url", "input_audio", "file"}
 _ALLOWED_SIZES    = {"1280x720", "720x1280", "1792x1024", "1024x1792", "1024x1024"}
 _EFFORT_VALUES    = {"none", "minimal", "low", "medium", "high", "xhigh"}
 _LITE_IMAGE_MODELS = {"grok-imagine-image-lite", "grok-imagine-1.0-fast"}
+_IMAGE_GENERATION_METHOD = "imagine_ws_experimental"
+_VIDEO_RATIO_TO_SIZE = {
+    "16:9": "1280x720",
+    "9:16": "720x1280",
+    "1:1": "1024x1024",
+    "2:3": "1024x1792",
+    "3:2": "1792x1024",
+}
+_VIDEO_RESOLUTION_ALIASES = {
+    "sd": "480p",
+    "hd": "720p",
+    "480p": "480p",
+    "720p": "720p",
+}
 
 
 def _validate_chat(req: ChatCompletionRequest) -> None:
@@ -172,6 +186,38 @@ def _validate_image_n(model_name: str, n: int, *, param: str) -> None:
 def _validate_image_edit_n(n: int, *, param: str) -> None:
     if not (1 <= n <= 2):
         raise ValidationError("n must be between 1 and 2 for image edit", param=param)
+
+
+def _resolve_video_size_alias(size: str | None, aspect_ratio: str | None, *, param: str) -> str:
+    ratio = (aspect_ratio or "").strip()
+    if ratio:
+        resolved = _VIDEO_RATIO_TO_SIZE.get(ratio)
+        if resolved is None:
+            raise ValidationError(
+                f"aspect_ratio must be one of {sorted(_VIDEO_RATIO_TO_SIZE)}",
+                param=param,
+            )
+        return resolved
+    normalized = (size or "720x1280").strip()
+    return _VIDEO_RATIO_TO_SIZE.get(normalized, normalized)
+
+
+def _resolve_video_resolution_alias(
+    resolution_name: str | None,
+    resolution: str | None,
+    *,
+    param: str,
+) -> str | None:
+    raw = (resolution or "").strip()
+    if not raw:
+        return resolution_name
+    resolved = _VIDEO_RESOLUTION_ALIASES.get(raw.lower())
+    if resolved is None:
+        raise ValidationError(
+            f"resolution must be one of {sorted(_VIDEO_RESOLUTION_ALIASES)}",
+            param=param,
+        )
+    return resolved
 
 
 async def _upload_to_data_uri(upload: UploadFile, *, param: str) -> str:
@@ -248,15 +294,24 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
         elif spec.is_video():
             from .video import completions as vid_comp
             vcfg = req.video_config or VideoConfig()
+            seconds = vcfg.video_length or vcfg.seconds or 6
             from .video import validate_video_length as _validate_video_length
-            _validate_video_length(vcfg.seconds or 6)
+            _validate_video_length(seconds)
             result = await vid_comp(
                 model           = req.model,
                 messages        = messages,
                 stream          = req.stream,
-                seconds         = vcfg.seconds or 6,
-                size            = vcfg.size or "720x1280",
-                resolution_name = vcfg.resolution_name,
+                seconds         = seconds,
+                size            = _resolve_video_size_alias(
+                    vcfg.size,
+                    vcfg.aspect_ratio,
+                    param="video_config.aspect_ratio",
+                ),
+                resolution_name = _resolve_video_resolution_alias(
+                    vcfg.resolution_name,
+                    vcfg.resolution,
+                    param="video_config.resolution",
+                ),
                 preset          = vcfg.preset,
             )
 
@@ -367,6 +422,11 @@ async def responses_endpoint(req: ResponsesCreateRequest):
 # /v1/images/generations (standalone image endpoint)
 # ---------------------------------------------------------------------------
 
+@router.get("/images/method", tags=[_TAG_IMAGES], dependencies=[Depends(verify_api_key)])
+async def image_generation_method():
+    return JSONResponse({"image_generation_method": _IMAGE_GENERATION_METHOD})
+
+
 @router.post("/images/generations", tags=[_TAG_IMAGES], dependencies=[Depends(verify_api_key)])
 async def image_generations(req: ImageGenerationRequest):
     spec = model_registry.get(req.model)
@@ -381,10 +441,12 @@ async def image_generations(req: ImageGenerationRequest):
         n               = req.n or 1,
         size            = req.size or "1024x1024",
         response_format = req.response_format or "url",
-        stream          = False,
+        stream          = bool(req.stream),
         chat_format     = False,
     )
-    return JSONResponse(result)
+    if isinstance(result, dict):
+        return JSONResponse(result)
+    return StreamingResponse(_safe_sse(result), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 # ---------------------------------------------------------------------------
@@ -396,8 +458,11 @@ async def videos_create(
     model: Annotated[str, Form(...)],
     prompt: Annotated[str, Form(...)],
     seconds: Annotated[int, Form()] = 6,
-    size: Annotated[Literal["720x1280", "1280x720", "1024x1024", "1024x1792", "1792x1024"], Form()] = "720x1280",
-    resolution_name: Annotated[Literal["480p", "720p"] | None, Form()] = None,
+    video_length: Annotated[int | None, Form()] = None,
+    size: Annotated[str, Form()] = "720x1280",
+    aspect_ratio: Annotated[str | None, Form()] = None,
+    resolution_name: Annotated[str | None, Form()] = None,
+    resolution: Annotated[str | None, Form()] = None,
     preset: Annotated[Literal["fun", "normal", "spicy", "custom"] | None, Form()] = None,
     input_reference: Annotated[UploadFile | None, File()] = None,
 ):
@@ -412,9 +477,13 @@ async def videos_create(
     result = await create_video(
         model=model or "grok-video",
         prompt=prompt,
-        seconds=seconds,
-        size=size or "720x1280",
-        resolution_name=resolution_name,
+        seconds=video_length or seconds,
+        size=_resolve_video_size_alias(size, aspect_ratio, param="aspect_ratio"),
+        resolution_name=_resolve_video_resolution_alias(
+            resolution_name,
+            resolution,
+            param="resolution",
+        ),
         preset=preset,
         input_reference=reference_payload,
     )
@@ -442,7 +511,8 @@ async def videos_content(video_id: str):
 async def image_edits(
     model: Annotated[str, Form(...)],
     prompt: Annotated[str, Form(...)],
-    image: Annotated[list[UploadFile], File(..., alias="image[]")],
+    image: Annotated[list[UploadFile] | None, File(alias="image[]")] = None,
+    image_plain: Annotated[list[UploadFile] | None, File(alias="image")] = None,
     mask: Annotated[UploadFile | None, File()] = None,
     n: Annotated[int, Form()] = 1,
     size: Annotated[str, Form()] = "1024x1024",
@@ -454,11 +524,14 @@ async def image_edits(
     if mask is not None:
         raise ValidationError("mask is not supported yet", param="mask")
     _validate_image_edit_n(n, param="n")
+    image_files = image or image_plain or []
+    if not image_files:
+        raise ValidationError("image is required", param="image")
 
     from .images import edit as img_edit
     image_inputs = [
         await _upload_to_data_uri(item, param=f"image.{index}")
-        for index, item in enumerate(image)
+        for index, item in enumerate(image_files)
     ]
     # Wrap input into a single-message conversation.
     content = [{"type": "text", "text": prompt}]

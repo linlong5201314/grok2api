@@ -113,12 +113,48 @@ def _quota_brief(q: dict) -> dict:
     return out
 
 
+def _quota_remaining(q: dict, mode: str) -> int:
+    v = q.get(mode)
+    if not isinstance(v, dict):
+        return -1
+    try:
+        return int(v.get("remaining", -1))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _quota_window_known(q: dict, mode: str) -> bool:
+    v = q.get(mode)
+    if not isinstance(v, dict):
+        return False
+    if _quota_remaining(q, mode) < 0:
+        return False
+    try:
+        return int(v.get("source", 0) or 0) != 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _quota_known(q: dict) -> bool:
+    return any(_quota_window_known(q, mode) for mode in ("auto", "fast", "expert"))
+
+
+def _token_type(pool: str) -> str:
+    return "ssoSuper" if pool in {"super", "heavy"} else "sso"
+
+
 def _serialize_record(r) -> dict:
+    pool = r.pool or "basic"
+    quota = r.quota if isinstance(r.quota, dict) else {}
     return {
         "token":       r.token,
-        "pool":        r.pool or "basic",
+        "pool":        pool,
+        "token_type":  _token_type(pool),
         "status":      r.status,
-        "quota":       _quota_brief(r.quota) if isinstance(r.quota, dict) else {},
+        "quota":       _quota_brief(quota),
+        "quota_known": _quota_known(quota),
+        "heavy_quota": _quota_remaining(quota, "heavy"),
+        "heavy_quota_known": _quota_window_known(quota, "heavy"),
         "use_count":   r.usage_use_count or 0,
         "last_used_at": r.last_use_at,
         "tags":        r.tags or [],
@@ -299,6 +335,7 @@ async def edit_token(
         quota_auto=qs.auto.to_dict(),
         quota_fast=qs.fast.to_dict(),
         quota_expert=qs.expert.to_dict(),
+        quota_heavy=qs.heavy.to_dict() if qs.heavy else None,
         usage_use_delta=record.usage_use_count,
         usage_fail_delta=record.usage_fail_count,
         usage_sync_delta=record.usage_sync_count,

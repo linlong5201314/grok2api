@@ -61,11 +61,11 @@ _X_USER_ID_RE = re.compile(r"(?:^|;\s*)x-userid=([^;]+)")
 # ---------------------------------------------------------------------------
 
 _RATIO_MAP: dict[str, str] = {
-    "1280x720":  "16:9", "16:9": "16:9",
-    "720x1280":  "9:16", "9:16": "9:16",
-    "1792x1024": "3:2",  "3:2":  "3:2",
-    "1024x1792": "2:3",  "2:3":  "2:3",
-    "1024x1024": "1:1",  "1:1":  "1:1",
+    "1024x576": "16:9", "1280x720": "16:9", "1536x864": "16:9", "16:9": "16:9",
+    "576x1024": "9:16", "720x1280": "9:16", "864x1536": "9:16", "9:16": "9:16",
+    "768x512": "3:2", "1024x768": "3:2", "1536x1024": "3:2", "1792x1024": "3:2", "3:2": "3:2",
+    "512x768": "2:3", "768x1024": "2:3", "1024x1536": "2:3", "1024x1792": "2:3", "2:3": "2:3",
+    "512x512": "1:1", "1024x1024": "1:1", "1:1": "1:1",
 }
 
 
@@ -138,9 +138,11 @@ async def _lite_progress_updates(
 
 def _normalize_response_format(response_format: str) -> str:
     fmt = (response_format or "url").strip().lower()
+    if fmt == "base64":
+        return "b64_json"
     if fmt not in {"url", "b64_json"}:
         raise ValidationError(
-            "response_format must be one of ['url', 'b64_json']",
+            "response_format must be one of ['url', 'base64', 'b64_json']",
             param="response_format",
         )
     return fmt

@@ -9,6 +9,7 @@ from app.platform.auth.middleware import is_webui_enabled, verify_webui_key
 from app.platform.meta import get_project_version
 from app.platform.update_check import get_latest_release_info
 from .static_html import serve_static_html
+from .admin import compat_router as admin_api_compat_router
 from .admin import router as admin_api_router
 from .webui import router as webui_router
 
@@ -16,6 +17,7 @@ router = APIRouter()
 
 # Mount admin API sub-router (/admin/api/*)
 router.include_router(admin_api_router)
+router.include_router(admin_api_compat_router)
 router.include_router(webui_router)
 
 _DIR = Path(__file__).resolve().parents[2] / "statics"
@@ -46,9 +48,17 @@ async def admin_root():
 async def admin_login():
     return _serve_html("admin/login.html")
 
+@router.get("/login", include_in_schema=False)
+async def login_alias():
+    return RedirectResponse("/admin/login")
+
 @router.get("/admin/account", include_in_schema=False)
 async def admin_account():
     return _serve_html("admin/account.html")
+
+@router.get("/admin/token", include_in_schema=False)
+async def admin_token_alias():
+    return RedirectResponse("/admin/account")
 
 @router.get("/admin/config", include_in_schema=False)
 async def admin_config():
@@ -63,6 +73,10 @@ async def admin_cache():
 @router.get("/webui", include_in_schema=False)
 async def webui_root():
     return RedirectResponse("/webui/login")
+
+@router.get("/chat", include_in_schema=False)
+async def chat_alias():
+    return RedirectResponse("/webui/chat")
 
 @router.get("/webui/login", include_in_schema=False)
 async def webui_login():

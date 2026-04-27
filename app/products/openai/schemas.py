@@ -1,6 +1,6 @@
 """OpenAI-compatible request schemas (Pydantic models)."""
 
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -21,9 +21,12 @@ class ImageConfig(BaseModel):
 
 class VideoConfig(BaseModel):
     seconds: int | None = 6
-    size: Literal["720x1280", "1280x720", "1024x1024", "1024x1792", "1792x1024"] | None = "720x1280"
-    resolution_name: Literal["480p", "720p"] | None = None
-    preset: Literal["fun", "normal", "spicy", "custom"] | None = None
+    size: str | None = "720x1280"
+    resolution_name: str | None = None
+    preset: str | None = None
+    aspect_ratio: str | None = None
+    video_length: int | None = None
+    resolution: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -48,6 +51,8 @@ class ImageGenerationRequest(BaseModel):
     n:               int | None = Field(1, ge=1, le=10)
     size:            str | None = "1024x1024"
     response_format: str | None = "url"
+    stream:          bool | None = False
+    concurrency:     int | None = Field(None, ge=1)
 
 
 class ImageEditRequest(BaseModel):
