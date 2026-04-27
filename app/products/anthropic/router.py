@@ -41,7 +41,7 @@ class MessagesRequest(BaseModel):
     messages:    list[_Message]
     system:      Any = None          # string or array of content blocks
     max_tokens:  int | None = None   # ignored (Grok doesn't expose this param)
-    stream:      bool | None = None
+    stream:      bool | None = False
     temperature: float | None = None
     top_p:       float | None = None
     tools:       list[dict] | None = None
@@ -92,7 +92,7 @@ async def messages_endpoint(req: MessagesRequest):
         raise ValidationError("messages cannot be empty", param="messages")
 
     cfg       = get_config()
-    is_stream = req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
+    is_stream = bool(req.stream)
 
     # thinking flag: enable when request has thinking config or config default
     if req.thinking is not None and isinstance(req.thinking, dict):

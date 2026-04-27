@@ -251,6 +251,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
             param="model", code="model_not_found",
         )
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
+    is_stream = bool(req.stream)
 
     try:
         # Dispatch by model capability.
@@ -264,7 +265,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 n               = cfg.n or 1,
                 size            = cfg.size or "1024x1024",
                 response_format = cfg.response_format or "url",
-                stream          = bool(req.stream),
+                stream          = is_stream,
                 chat_format     = True,
             )
 
@@ -287,7 +288,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 n               = n,
                 size            = size,
                 response_format = fmt,
-                stream          = bool(req.stream),
+                stream          = is_stream,
                 chat_format     = True,
             )
 
@@ -300,7 +301,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
             result = await vid_comp(
                 model           = req.model,
                 messages        = messages,
-                stream          = req.stream,
+                stream          = is_stream,
                 seconds         = seconds,
                 size            = _resolve_video_size_alias(
                     vcfg.size,
@@ -319,7 +320,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
             result = await chat_completions(
                 model       = req.model,
                 messages    = messages,
-                stream      = req.stream,
+                stream      = is_stream,
                 thinking    = req.thinking,
                 tools       = req.tools,
                 tool_choice = req.tool_choice,
@@ -336,7 +337,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
             req.stream,
             exc,
         )
-        if req.stream is not False:
+        if is_stream:
             _err_msg = str(exc)  # capture before Python clears the except-scope variable
             async def _err_stream():
                 payload = orjson.dumps({"error": {"message": _err_msg, "type": "server_error"}}).decode()
@@ -385,7 +386,7 @@ async def responses_endpoint(req: ResponsesCreateRequest):
         raise _ValidationError("input cannot be empty", param="input")
 
     cfg        = get_config()
-    is_stream  = req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
+    is_stream  = bool(req.stream)
 
     # Map reasoning param → emit_think flag.
     # reasoning=None → use config; reasoning.effort="none" → off; otherwise on.

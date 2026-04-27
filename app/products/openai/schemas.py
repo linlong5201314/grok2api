@@ -32,7 +32,7 @@ class VideoConfig(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model:               str
     messages:            list[MessageItem]
-    stream:              bool | None                = None
+    stream:              bool | None                = False
     thinking:            bool | None                = None
     reasoning_effort:    str | None                 = None
     temperature:         float | None               = 0.8
@@ -74,7 +74,7 @@ class ResponsesCreateRequest(BaseModel):
     model:                str
     input:                str | list[Any]
     instructions:         str | None           = None
-    stream:               bool | None          = None
+    stream:               bool | None          = False
     reasoning:            dict[str, Any] | None = None
     temperature:          float | None         = None
     top_p:                float | None         = None
