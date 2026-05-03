@@ -3,6 +3,7 @@
 import asyncio
 import base64
 from typing import Any, AsyncGenerator
+from urllib.parse import urlparse
 
 import orjson
 
@@ -15,7 +16,7 @@ from app.platform.tokens import (
     estimate_tokens,
     estimate_tool_call_tokens,
 )
-from app.platform.storage import image_files_dir
+from app.platform.storage import save_local_image
 from app.control.account.runtime import get_refresh_service
 from app.control.account.invalid_credentials import feedback_kind_for_error
 from app.control.model.registry import resolve as resolve_model
@@ -145,12 +146,15 @@ async def _download_image_bytes(token: str, url: str) -> tuple[bytes, str]:
 
 def _save_image(raw: bytes, mime: str, image_id: str) -> str:
     """Save raw bytes to ``${DATA_DIR}/files/images`` and return the file ID."""
-    img_dir = image_files_dir()
-    ext = ".png" if "png" in mime else ".jpg"
-    path = img_dir / f"{image_id}{ext}"
-    if not path.exists():
-        path.write_bytes(raw)
-    return image_id
+    return save_local_image(raw, mime, image_id)
+
+
+def _is_imagine_public_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    return host.startswith("imagine-public")
 
 
 async def _resolve_image(token: str, url: str, image_id: str) -> str:
@@ -165,11 +169,15 @@ async def _resolve_image(token: str, url: str, image_id: str) -> str:
     """
     cfg = get_config()
     fmt = _normalize_image_format(cfg.get_str("features.image_format", "grok_url"))
+    proxy_imagine_public = (
+        _is_imagine_public_url(url)
+        and cfg.get_bool("features.imagine_public_image_proxy", False)
+    )
 
     # Formats that don't need downloading
-    if fmt == "grok_url":
+    if fmt == "grok_url" and not proxy_imagine_public:
         return url
-    if fmt == "grok_md":
+    if fmt == "grok_md" and not proxy_imagine_public:
         return f"![image]({url})"
 
     # Formats that require downloading
@@ -267,6 +275,38 @@ def _extract_message(messages: list[dict]) -> tuple[str, list[str]]:
     return "\n\n".join(parts), files
 
 
+def _mode_candidates(spec, cfg) -> tuple[int, ...]:
+    primary = int(spec.mode_id)
+    if (
+        spec.is_chat()
+        and spec.mode_id == ModeId.AUTO
+        and cfg.get_bool("features.auto_chat_mode_fallback", True)
+    ):
+        return (primary, int(ModeId.FAST), int(ModeId.EXPERT))
+    return (primary,)
+
+
+async def _reserve_chat_account(
+    directory,
+    spec,
+    cfg,
+    *,
+    exclude_tokens: list[str] | None,
+    now_s_override: int,
+):
+    original_mode_id = int(spec.mode_id)
+    for candidate_mode_id in _mode_candidates(spec, cfg):
+        acct = await directory.reserve(
+            pool_candidates=spec.pool_candidates(),
+            mode_id=candidate_mode_id,
+            now_s_override=now_s_override,
+            exclude_tokens=exclude_tokens,
+        )
+        if acct is not None:
+            return acct, candidate_mode_id
+    return None, original_mode_id
+
+
 async def _prepare_file_attachments(token: str, file_inputs: list[str]) -> list[str]:
     """Upload OpenAI-style multimodal inputs and return Grok chat attachment IDs."""
     attachments: list[str] = []
@@ -358,7 +398,6 @@ async def completions(
     """
     cfg = get_config()
     spec = resolve_model(model)
-    mode_id = int(spec.mode_id)  # cast once, reuse everywhere
     is_stream = stream if stream is not None else cfg.get_bool("features.stream", True)
     emit_think = (
         thinking if thinking is not None else cfg.get_bool("features.thinking", True)
@@ -400,9 +439,10 @@ async def completions(
         async def _run_stream() -> AsyncGenerator[str, None]:
             excluded: list[str] = []
             for attempt in range(max_retries + 1):
-                acct = await directory.reserve(
-                    pool_candidates=spec.pool_candidates(),
-                    mode_id=mode_id,
+                acct, selected_mode_id = await _reserve_chat_account(
+                    directory,
+                    spec,
+                    cfg,
                     now_s_override=now_s(),
                     exclude_tokens=excluded or None,
                 )
@@ -422,7 +462,7 @@ async def completions(
                         tool_calls_emitted = False
                         async for line in _stream_chat(
                             token=token,
-                            mode_id=spec.mode_id,
+                            mode_id=ModeId(selected_mode_id),
                             message=message,
                             files=files,
                             tool_overrides=tool_overrides,
@@ -570,14 +610,16 @@ async def completions(
                         if fail_exc
                         else FeedbackKind.SERVER_ERROR
                     )
-                    await directory.feedback(token, kind, mode_id, now_s_val=now_s())
+                    await directory.feedback(
+                        token, kind, selected_mode_id, now_s_val=now_s()
+                    )
                     if success:
                         asyncio.create_task(
-                            _quota_sync(token, mode_id)
+                            _quota_sync(token, selected_mode_id)
                         ).add_done_callback(_log_task_exception)
                     else:
                         asyncio.create_task(
-                            _fail_sync(token, mode_id, fail_exc)
+                            _fail_sync(token, selected_mode_id, fail_exc)
                         ).add_done_callback(_log_task_exception)
 
                 if success or not _retry:
@@ -591,9 +633,10 @@ async def completions(
     token = ""
     adapter = StreamAdapter()
     for attempt in range(max_retries + 1):
-        acct = await directory.reserve(
-            pool_candidates=spec.pool_candidates(),
-            mode_id=mode_id,
+        acct, selected_mode_id = await _reserve_chat_account(
+            directory,
+            spec,
+            cfg,
             now_s_override=now_s(),
             exclude_tokens=excluded or None,
         )
@@ -610,7 +653,7 @@ async def completions(
             try:
                 async for line in _stream_chat(
                     token=token,
-                    mode_id=spec.mode_id,
+                    mode_id=ModeId(selected_mode_id),
                     message=message,
                     files=files,
                     tool_overrides=tool_overrides,
@@ -654,14 +697,16 @@ async def completions(
                 if fail_exc
                 else FeedbackKind.SERVER_ERROR
             )
-            await directory.feedback(token, kind, mode_id, now_s_val=now_s())
+            await directory.feedback(
+                token, kind, selected_mode_id, now_s_val=now_s()
+            )
             if success:
-                asyncio.create_task(_quota_sync(token, mode_id)).add_done_callback(
-                    _log_task_exception
-                )
+                asyncio.create_task(
+                    _quota_sync(token, selected_mode_id)
+                ).add_done_callback(_log_task_exception)
             else:
                 asyncio.create_task(
-                    _fail_sync(token, mode_id, fail_exc)
+                    _fail_sync(token, selected_mode_id, fail_exc)
                 ).add_done_callback(_log_task_exception)
 
         if success or not _retry:

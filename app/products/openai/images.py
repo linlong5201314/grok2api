@@ -8,6 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Awaitable, Callable
+from urllib.parse import urlparse
 
 import orjson
 
@@ -15,7 +16,7 @@ from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
 from app.platform.errors import RateLimitError, UpstreamError, ValidationError
 from app.platform.runtime.clock import now_s
-from app.platform.storage import image_files_dir
+from app.platform.storage import save_local_image
 from app.control.model.registry import resolve as resolve_model
 from app.control.model.enums import ModeId
 from app.control.model.spec import ModelSpec
@@ -167,12 +168,15 @@ def _extract_image_file_id(url: str) -> str:
 
 
 def _save_image(raw: bytes, mime: str, file_id: str) -> str:
-    img_dir = image_files_dir()
-    ext = ".png" if "png" in mime else ".jpg"
-    path = img_dir / f"{file_id}{ext}"
-    if not path.exists():
-        path.write_bytes(raw)
-    return file_id
+    return save_local_image(raw, mime, file_id)
+
+
+def _is_imagine_public_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    return host.startswith("imagine-public")
 
 
 async def _download_image_bytes(token: str, url: str) -> tuple[bytes, str]:
@@ -196,6 +200,13 @@ async def _resolve_image_output(
     blob_b64: str | None = None,
 ) -> _ImageOutput:
     fmt = _normalize_response_format(response_format)
+    cfg = get_config()
+    if (
+        fmt == "url"
+        and _is_imagine_public_url(url)
+        and not cfg.get_bool("features.imagine_public_image_proxy", False)
+    ):
+        return _ImageOutput(api_value=url, markdown_value=f"![image]({url})")
     if fmt == "url" and not _app_url():
         return _ImageOutput(api_value=url, markdown_value=f"![image]({url})")
 
@@ -564,7 +575,7 @@ async def _generate_lite(
 # Image editing
 # ---------------------------------------------------------------------------
 
-_EDIT_MAX_REFERENCES = 5
+_EDIT_MAX_REFERENCES = 7
 _EDIT_DEFAULT_SIZE = "1024x1024"
 _EDIT_MAX_N = 2
 _EDIT_MAX_ATTEMPTS = 2

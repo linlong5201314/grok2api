@@ -181,6 +181,8 @@ class StreamAdapter:
         "_summary_mode",
         "_last_rollout",
         "_content_started",
+        "_web_search_results",
+        "_web_search_urls_seen",
         "thinking_buf",
         "text_buf",
         "image_urls",
@@ -197,14 +199,24 @@ class StreamAdapter:
         self._last_rollout: str = ""
         self._content_started: bool = False
         self._reasoning = ReasoningAggregator() if self._summary_mode else None
+        self._web_search_results: list[dict] = []
+        self._web_search_urls_seen: set[str] = set()
         self.thinking_buf: list[str] = []
         self.text_buf: list[str] = []
         self.image_urls: list[tuple[str, str]] = []   # [(url, imageUuid), ...]
 
     # 引用已内联为 [[N]](url) 格式，无需末尾附录
     def references_suffix(self) -> str:
-        """No-op — citations are now inlined as ``[[N]](url)`` markdown links."""
-        return ""
+        if not self._web_search_results:
+            return ""
+        if not get_config().get_bool("features.show_search_sources", False):
+            return ""
+        lines = ["\n\n## Sources", "[grok2api-sources]: #"]
+        for item in self._web_search_results:
+            title = item.get("title") or item.get("url", "")
+            title = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            lines.append(f"- [{title}]({item['url']})")
+        return "\n".join(lines) + "\n"
 
     # ------------------------------------------------------------------
     # Public API
@@ -230,6 +242,29 @@ class StreamAdapter:
         card_raw = resp.get("cardAttachment")
         if card_raw:
             events.extend(self._handle_card(card_raw))
+
+        wsr = resp.get("webSearchResults")
+        if wsr and isinstance(wsr, dict):
+            for item in wsr.get("results", []):
+                if isinstance(item, dict) and item.get("url"):
+                    url = item["url"]
+                    if url not in self._web_search_urls_seen:
+                        self._web_search_urls_seen.add(url)
+                        self._web_search_results.append({**item, "type": "web"})
+
+        xsr = resp.get("xSearchResults")
+        if xsr and isinstance(xsr, dict):
+            for item in xsr.get("results", []):
+                if isinstance(item, dict) and item.get("postId") and item.get("username"):
+                    url = f"https://x.com/{item['username']}/status/{item['postId']}"
+                    if url not in self._web_search_urls_seen:
+                        self._web_search_urls_seen.add(url)
+                        raw = re.sub(r"\s+", " ", (item.get("text") or "")).strip()
+                        if raw:
+                            title = f"𝕏/@{item['username']}: {raw[:50]}{'...' if len(raw) > 50 else ''}"
+                        else:
+                            title = f"𝕏/@{item['username']}"
+                        self._web_search_results.append({"url": url, "title": title, "type": "x_post"})
 
         token   = resp.get("token")
         think   = resp.get("isThinking")
@@ -268,7 +303,7 @@ class StreamAdapter:
             return events
 
         # ── toolUsageCardId-only follow-up frame ──────────────────
-        if resp.get("toolUsageCardId") and not resp.get("webSearchResults") and not resp.get("codeExecutionResult"):
+        if resp.get("toolUsageCardId") and not resp.get("webSearchResults") and not resp.get("xSearchResults") and not resp.get("codeExecutionResult"):
             return events
 
         # ── 思维链 token 处理 ──────────────────────────────────────

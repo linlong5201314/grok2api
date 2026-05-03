@@ -32,12 +32,14 @@ stream = true
 thinking = true
 # 思考精简输出（false=完整原始推理过程，true=提炼结构化摘要）
 thinking_summary = false
+auto_chat_mode_fallback = true
 # 是否动态生成 Statsig 指纹
 dynamic_statsig = true
 # 是否允许生成 NSFW 图片
 enable_nsfw = true
 # 全局附加指令
 custom_instruction = ""
+show_search_sources = false
 
 # 图片返回格式
 #   grok_url  — 直接返回 Grok CDN URL
@@ -46,6 +48,7 @@ custom_instruction = ""
 #   local_md  — Markdown 内嵌本地代理 URL
 #   base64    — Markdown 内嵌 Base64 Data URI
 image_format = "grok_url"
+imagine_public_image_proxy = false
 
 # 视频返回格式
 #   grok_url  — 直接返回 Grok CDN URL
@@ -53,6 +56,10 @@ image_format = "grok_url"
 #   grok_html — HTML <video> 标签，src 为 Grok CDN URL
 #   local_html — HTML <video> 标签，src 为本地代理 URL
 video_format = "grok_url"
+
+[cache.local]
+image_max_mb = 0
+video_max_mb = 0
 
 
 # ==================== 代理配置 ====================
@@ -98,7 +105,7 @@ on_codes = "429,401,403,503"
 
 
 [account.refresh]
-basic_interval_sec = 36000   # basic 号池刷新周期（秒），默认 10 h
+basic_interval_sec = 86400   # basic 号池刷新周期（秒），默认 24 h
 super_interval_sec = 7200    # super 号池刷新周期（秒），默认 2 h
 heavy_interval_sec = 7200    # heavy 号池刷新周期（秒），默认 2 h
 usage_concurrency = 50
