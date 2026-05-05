@@ -6,7 +6,10 @@ in a structured XML format we can reliably parse.
 from __future__ import annotations
 
 import json
+from xml.sax.saxutils import escape
 from typing import Any
+
+from .tool_request import strict_tool_names
 
 # ---------------------------------------------------------------------------
 # Instruction template
@@ -65,6 +68,9 @@ def build_tool_system_prompt(
     """
     tool_defs = _format_tool_definitions(tools)
     choice_instruction = _build_choice_instruction(tools, tool_choice)
+    strict_instruction = _build_strict_instruction(tools)
+    if strict_instruction:
+        choice_instruction = f"{choice_instruction}\n{strict_instruction}"
     return _TOOL_SYSTEM_HEADER.format(
         tool_definitions=tool_defs,
         tool_choice_instruction=choice_instruction,
@@ -75,7 +81,11 @@ def extract_tool_names(tools: list[dict[str, Any]]) -> list[str]:
     """Return the list of function names from an OpenAI tools array."""
     names: list[str] = []
     for tool in tools:
+        if not isinstance(tool, dict):
+            continue
         func = tool.get("function") or {}
+        if not isinstance(func, dict):
+            continue
         name = func.get("name", "").strip()
         if name:
             names.append(name)
@@ -92,17 +102,27 @@ def tool_calls_to_xml(tool_calls: list[dict[str, Any]]) -> str:
     prompts, so multi-turn conversations reconstruct context correctly."""
     lines = ["<tool_calls>"]
     for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
         func = tc.get("function") or {}
+        if not isinstance(func, dict):
+            continue
         name = func.get("name", "")
         args = func.get("arguments", "{}")
         # Normalise to single-line JSON
-        try:
-            args = json.dumps(json.loads(args), ensure_ascii=False, separators=(",", ":"))
-        except (json.JSONDecodeError, ValueError, TypeError):
-            pass
+        if isinstance(args, str):
+            try:
+                args = json.dumps(json.loads(args), ensure_ascii=False, separators=(",", ":"))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+        else:
+            try:
+                args = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                args = str(args)
         lines.append("  <tool_call>")
-        lines.append(f"    <tool_name>{name}</tool_name>")
-        lines.append(f"    <parameters>{args}</parameters>")
+        lines.append(f"    <tool_name>{_xml_escape(name)}</tool_name>")
+        lines.append(f"    <parameters>{_xml_escape(args)}</parameters>")
         lines.append("  </tool_call>")
     lines.append("</tool_calls>")
     return "\n".join(lines)
@@ -115,7 +135,11 @@ def tool_calls_to_xml(tool_calls: list[dict[str, Any]]) -> str:
 def _format_tool_definitions(tools: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for tool in tools:
+        if not isinstance(tool, dict):
+            continue
         func = tool.get("function") or {}
+        if not isinstance(func, dict):
+            continue
         name = func.get("name", "").strip()
         desc = (func.get("description") or "").strip()
         params = func.get("parameters")
@@ -155,3 +179,18 @@ def _build_choice_instruction(
             if forced_name:
                 return _CHOICE_FORCED.format(name=forced_name)
     return _CHOICE_AUTO
+
+
+def _xml_escape(value: Any) -> str:
+    return escape(str(value), {'"': "&quot;", "'": "&apos;"})
+
+
+def _build_strict_instruction(tools: list[dict[str, Any]]) -> str:
+    names = strict_tool_names(tools)
+    if not names:
+        return ""
+    return (
+        "STRICT TOOL MODE: The tool arguments for "
+        + ", ".join(sorted(names))
+        + " must strictly follow the declared JSON Schema. Do not include undeclared properties."
+    )

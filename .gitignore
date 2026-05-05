@@ -37,6 +37,8 @@ env/
 
 # Environment Variables
 .env
+.env.*
+import.env
 
 # Logs
 logs/

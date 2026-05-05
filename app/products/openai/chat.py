@@ -35,11 +35,16 @@ from app.dataplane.reverse.runtime.endpoint_table import CHAT
 from app.dataplane.reverse.transport.asset_upload import upload_from_input
 from app.dataplane.reverse.protocol.tool_prompt import (
     build_tool_system_prompt,
-    extract_tool_names,
     inject_into_message,
     tool_calls_to_xml,
 )
 from app.dataplane.reverse.protocol.tool_parser import parse_tool_calls
+from app.dataplane.reverse.protocol.tool_request import (
+    allowed_tool_names,
+    normalize_parsed_tool_calls,
+    validate_strict_tools,
+    validate_tool_choice_tools,
+)
 from ._format import (
     make_response_id,
     make_stream_chunk,
@@ -58,6 +63,16 @@ def _log_task_exception(task: "asyncio.Task") -> None:
     exc = task.exception() if not task.cancelled() else None
     if exc:
         logger.warning("background task failed: task={} error={}", task.get_name(), exc)
+
+
+def _sampling_model_config(temperature: float | None, top_p: float | None) -> dict[str, Any] | None:
+    cfg: dict[str, Any] = {}
+    if temperature is not None:
+        cfg["temperature"] = temperature
+    if top_p is not None:
+        cfg["topP"] = top_p
+        cfg["top_p"] = top_p
+    return cfg or None
 
 
 async def _quota_sync(token: str, mode_id: int) -> None:
@@ -427,11 +442,15 @@ async def completions(
 
     # ── Tool call setup ───────────────────────────────────────────────────────
     tool_names: list[str] = []
+    validate_tool_choice_tools(tools, tool_choice)
     if tools:
-        tool_names = extract_tool_names(tools)
-        tool_prompt = build_tool_system_prompt(tools, tool_choice)
-        message = inject_into_message(message, tool_prompt)
+        validate_strict_tools(tools)
+        tool_names = allowed_tool_names(tools, tool_choice)
+        if tool_names:
+            tool_prompt = build_tool_system_prompt(tools, tool_choice)
+            message = inject_into_message(message, tool_prompt)
     tool_overrides: dict | None = None
+    model_config_override = _sampling_model_config(temperature, top_p)
 
     # ── Streaming path ────────────────────────────────────────────────────────
     if is_stream:
@@ -466,6 +485,7 @@ async def completions(
                             message=message,
                             files=files,
                             tool_overrides=tool_overrides,
+                            model_config_override=model_config_override,
                             request_overrides=request_overrides,
                             timeout_s=timeout_s,
                         ):
@@ -487,6 +507,7 @@ async def completions(
                                             )
                                             yield f"data: {orjson.dumps(chunk).decode()}\n\n"
                                         if parsed_calls is not None:
+                                            parsed_calls = normalize_parsed_tool_calls(parsed_calls, tools)
                                             for i, tc in enumerate(parsed_calls):
                                                 chunk = make_tool_call_chunk(
                                                     response_id,
@@ -532,8 +553,14 @@ async def completions(
 
                         if not tool_calls_emitted and tool_names:
                             # Stream ended — flush sieve for any buffered XML
-                            flushed_calls = sieve.flush()
+                            flushed_text, flushed_calls = sieve.flush()
+                            if flushed_text:
+                                chunk = make_stream_chunk(
+                                    response_id, model, flushed_text
+                                )
+                                yield f"data: {orjson.dumps(chunk).decode()}\n\n"
                             if flushed_calls:
+                                flushed_calls = normalize_parsed_tool_calls(flushed_calls, tools)
                                 for i, tc in enumerate(flushed_calls):
                                     chunk = make_tool_call_chunk(
                                         response_id,
@@ -657,6 +684,7 @@ async def completions(
                     message=message,
                     files=files,
                     tool_overrides=tool_overrides,
+                    model_config_override=model_config_override,
                     request_overrides=request_overrides,
                     timeout_s=timeout_s,
                 ):
@@ -737,20 +765,21 @@ async def completions(
     if tool_names:
         parse_result = parse_tool_calls(full_text, tool_names)
         if parse_result.calls:
+            tool_calls = normalize_parsed_tool_calls(parse_result.calls, tools)
             logger.info(
                 "chat request tool_calls: attempt={}/{} model={} call_count={}",
                 attempt + 1,
                 max_retries + 1,
                 model,
-                len(parse_result.calls),
+                len(tool_calls),
             )
             pt = estimate_prompt_tokens(message)
             return make_tool_call_response(
                 model,
-                parse_result.calls,
+                tool_calls,
                 prompt_content=message,
                 response_id=response_id,
-                usage=build_usage(pt, estimate_tool_call_tokens(parse_result.calls)),
+                usage=build_usage(pt, estimate_tool_call_tokens(tool_calls)),
             )
 
     logger.info(

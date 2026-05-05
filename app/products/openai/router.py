@@ -14,6 +14,7 @@ from app.platform.auth.middleware import verify_api_key
 from app.platform.errors import AppError, ValidationError
 from app.platform.logging.logger import logger
 from app.platform.storage import image_files_dir, video_files_dir
+from app.dataplane.reverse.protocol.tool_request import normalize_openai_tool_choice, normalize_openai_tools
 from app.control.model import registry as model_registry
 from app.control.model.spec import ModelSpec
 from .schemas import (
@@ -257,12 +258,13 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
         # Dispatch by model capability.
         if spec.is_image_edit():
             from .images import edit as img_edit
-            cfg    = req.image_config or ImageConfig()
-            _validate_image_edit_n(cfg.n or 1, param="image_config.n")
+            cfg = req.image_config or ImageConfig()
+            n = cfg.n if cfg.n is not None else 1
+            _validate_image_edit_n(n, param="image_config.n")
             result = await img_edit(
                 model           = req.model,
                 messages        = messages,
-                n               = cfg.n or 1,
+                n               = n,
                 size            = cfg.size or "1024x1024",
                 response_format = cfg.response_format or "url",
                 stream          = is_stream,
@@ -274,7 +276,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
             cfg   = req.image_config or ImageConfig()
             size  = cfg.size or "1024x1024"
             fmt   = cfg.response_format or "url"
-            n     = cfg.n or 1
+            n     = cfg.n if cfg.n is not None else 1
             _validate_image_n(req.model, n, param="image_config.n")
             # Extract prompt from last user message.
             prompt = next(
@@ -295,7 +297,11 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
         elif spec.is_video():
             from .video import completions as vid_comp
             vcfg = req.video_config or VideoConfig()
-            seconds = vcfg.video_length or vcfg.seconds or 6
+            seconds = vcfg.video_length
+            if seconds is None:
+                seconds = vcfg.seconds
+            if seconds is None:
+                seconds = 6
             from .video import validate_video_length as _validate_video_length
             _validate_video_length(seconds)
             result = await vid_comp(
@@ -322,10 +328,10 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 messages    = messages,
                 stream      = is_stream,
                 thinking    = req.thinking,
-                tools       = req.tools,
-                tool_choice = req.tool_choice,
-                temperature = req.temperature or 0.8,
-                top_p       = req.top_p or 0.95,
+                tools       = normalize_openai_tools(req.tools, req.functions),
+                tool_choice = normalize_openai_tool_choice(req.tool_choice, req.function_call),
+                temperature = req.temperature if req.temperature is not None else 0.8,
+                top_p       = req.top_p if req.top_p is not None else 0.95,
             )
 
     except AppError:
@@ -404,10 +410,10 @@ async def responses_endpoint(req: ResponsesCreateRequest):
         instructions = req.instructions,
         stream       = is_stream,
         emit_think   = emit_think,
-        temperature  = req.temperature or 0.8,
-        top_p        = req.top_p or 0.95,
+        temperature  = req.temperature if req.temperature is not None else 0.8,
+        top_p        = req.top_p if req.top_p is not None else 0.95,
         tools        = req.tools or None,
-        tool_choice  = req.tool_choice,
+        tool_choice  = normalize_openai_tool_choice(req.tool_choice, None),
     )
 
     if isinstance(result, dict):
@@ -433,13 +439,14 @@ async def image_generations(req: ImageGenerationRequest):
     spec = model_registry.get(req.model)
     if spec is None or not spec.enabled or not spec.is_image():
         raise ValidationError(f"Model {req.model!r} is not an image model", param="model")
-    _validate_image_n(req.model, req.n or 1, param="n")
+    n = req.n if req.n is not None else 1
+    _validate_image_n(req.model, n, param="n")
 
     from .images import generate as img_gen
     result = await img_gen(
         model           = req.model,
         prompt          = req.prompt,
-        n               = req.n or 1,
+        n               = n,
         size            = req.size or "1024x1024",
         response_format = req.response_format or "url",
         stream          = bool(req.stream),
@@ -478,7 +485,7 @@ async def videos_create(
     result = await create_video(
         model=model or "grok-video",
         prompt=prompt,
-        seconds=video_length or seconds,
+        seconds=video_length if video_length is not None else seconds,
         size=_resolve_video_size_alias(size, aspect_ratio, param="aspect_ratio"),
         resolution_name=_resolve_video_resolution_alias(
             resolution_name,

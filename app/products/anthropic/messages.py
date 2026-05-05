@@ -24,12 +24,18 @@ from app.control.model.registry import resolve as resolve_model
 from app.control.account.enums import FeedbackKind
 from app.dataplane.reverse.protocol.xai_chat import classify_line, StreamAdapter
 from app.dataplane.reverse.protocol.tool_prompt import (
-    build_tool_system_prompt, extract_tool_names, inject_into_message,
+    build_tool_system_prompt, inject_into_message,
 )
 from app.dataplane.reverse.protocol.tool_parser import parse_tool_calls
+from app.dataplane.reverse.protocol.tool_request import (
+    allowed_tool_names,
+    normalize_parsed_tool_calls,
+    validate_strict_tools,
+    validate_tool_choice_tools,
+)
 
 from app.products.openai.chat import (
-    _stream_chat, _extract_message, _resolve_image,
+    _sampling_model_config, _stream_chat, _extract_message, _resolve_image,
     _quota_sync, _fail_sync, _feedback_kind, _log_task_exception,
     _configured_retry_codes, _reserve_chat_account, _should_retry_upstream,
 )
@@ -95,6 +101,13 @@ def _anthropic_content_to_internal(content: Any, role: str) -> list[dict]:
                     b.get("text", "") for b in result_content
                     if isinstance(b, dict) and b.get("type") == "text"
                 )
+            elif isinstance(result_content, dict):
+                try:
+                    result_content = orjson.dumps(result_content).decode()
+                except Exception:
+                    result_content = str(result_content)
+            elif not isinstance(result_content, str):
+                result_content = "" if result_content is None else str(result_content)
             messages.append({
                 "role":         "tool",
                 "tool_call_id": block.get("tool_use_id", ""),
@@ -140,6 +153,8 @@ def _anthropic_content_to_internal(content: Any, role: str) -> list[dict]:
                 normalized.append({"type": "text", "text": text})
         elif btype == "image":
             source = block.get("source") or {}
+            if not isinstance(source, dict):
+                continue
             src_type = source.get("type", "")
             if src_type == "base64":
                 media = source.get("media_type", "image/jpeg")
@@ -155,6 +170,8 @@ def _anthropic_content_to_internal(content: Any, role: str) -> list[dict]:
                 })
         elif btype == "document":
             source = block.get("source") or {}
+            if not isinstance(source, dict):
+                continue
             src_type = source.get("type", "")
             if src_type == "base64":
                 media = source.get("media_type", "application/pdf")
@@ -206,12 +223,18 @@ def _convert_tools(tools: list[dict]) -> list[dict]:
     """
     result = []
     for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
         result.append({
             "type": "function",
             "function": {
-                "name":        tool.get("name", ""),
+                "name":        name,
                 "description": tool.get("description", ""),
                 "parameters":  tool.get("input_schema"),
+                "strict":      tool.get("strict"),
             },
         })
     return result
@@ -224,7 +247,11 @@ def _convert_tool_choice(tool_choice: Any) -> Any:
     if isinstance(tool_choice, str):
         return tool_choice
     if isinstance(tool_choice, dict):
+        if tool_choice.get("name") and not tool_choice.get("type"):
+            return {"type": "function", "function": {"name": tool_choice.get("name", "")}}
         tc_type = tool_choice.get("type", "auto")
+        if tc_type == "none":
+            return "none"
         if tc_type == "auto":
             return "auto"
         if tc_type == "any":
@@ -295,12 +322,16 @@ async def create(
     # Tool injection
     tool_names: list[str] = []
     internal_tool_choice: Any = None
+    chat_tools: list[dict] | None = None
+    internal_tool_choice = _convert_tool_choice(tool_choice)
+    validate_tool_choice_tools(tools, internal_tool_choice)
     if tools:
         chat_tools       = _convert_tools(tools)
-        tool_names       = extract_tool_names(chat_tools)
-        internal_tool_choice = _convert_tool_choice(tool_choice)
-        tool_prompt      = build_tool_system_prompt(chat_tools, internal_tool_choice)
-        internal_message = inject_into_message(internal_message, tool_prompt)
+        validate_strict_tools(chat_tools)
+        tool_names = allowed_tool_names(chat_tools, internal_tool_choice)
+        if tool_names:
+            tool_prompt      = build_tool_system_prompt(chat_tools, internal_tool_choice)
+            internal_message = inject_into_message(internal_message, tool_prompt)
         logger.info("messages tool injection: tool_names={} choice={}", tool_names, internal_tool_choice)
 
     from app.dataplane.account import _directory as _acct_dir
@@ -312,6 +343,7 @@ async def create(
     retry_codes = _configured_retry_codes(cfg)
     timeout_s   = cfg.get_float("chat.timeout", 120.0)
     msg_id      = _make_msg_id()
+    model_config_override = _sampling_model_config(temperature, top_p)
 
     # -------------------------------------------------------------------------
     # Streaming
@@ -367,6 +399,7 @@ async def create(
                         mode_id   = ModeId(selected_mode_id),
                         message   = internal_message,
                         files     = files,
+                        model_config_override = model_config_override,
                         timeout_s = timeout_s,
                     ):
                         if tool_calls_emitted:
@@ -409,6 +442,7 @@ async def create(
                                 if sieve is not None:
                                     safe_text, calls = sieve.feed(ev.content)
                                     if calls is not None:
+                                        calls = normalize_parsed_tool_calls(calls, chat_tools)
                                         # Emit tool_use blocks
                                         for call in calls:
                                             yield _sse("content_block_start", {
@@ -466,8 +500,23 @@ async def create(
 
                     # Flush sieve — incomplete XML at end of stream
                     if sieve is not None and not tool_calls_emitted:
-                        calls = sieve.flush()
+                        flushed_text, calls = sieve.flush()
+                        if flushed_text:
+                            if not text_started:
+                                text_started = True
+                                yield _sse("content_block_start", {
+                                    "type":          "content_block_start",
+                                    "index":         block_index,
+                                    "content_block": {"type": "text", "text": ""},
+                                })
+                            text_buf.append(flushed_text)
+                            yield _sse("content_block_delta", {
+                                "type":  "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "text_delta", "text": flushed_text},
+                            })
                         if calls:
+                            calls = normalize_parsed_tool_calls(calls, chat_tools)
                             # Close text block if open
                             if text_started:
                                 yield _sse("content_block_stop", {
@@ -521,22 +570,34 @@ async def create(
                             if isinstance(img_text, str):
                                 chunk = img_text + "\n"
                                 text_buf.append(chunk)
-                                if text_started:
-                                    yield _sse("content_block_delta", {
-                                        "type":  "content_block_delta",
-                                        "index": block_index,
-                                        "delta": {"type": "text_delta", "text": chunk},
+                                if not text_started:
+                                    text_started = True
+                                    yield _sse("content_block_start", {
+                                        "type":          "content_block_start",
+                                        "index":         block_index,
+                                        "content_block": {"type": "text", "text": ""},
                                     })
+                                yield _sse("content_block_delta", {
+                                    "type":  "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {"type": "text_delta", "text": chunk},
+                                })
 
                         references = adapter.references_suffix()
                         if references:
                             text_buf.append(references)
-                            if text_started:
-                                yield _sse("content_block_delta", {
-                                    "type":  "content_block_delta",
-                                    "index": block_index,
-                                    "delta": {"type": "text_delta", "text": references},
+                            if not text_started:
+                                text_started = True
+                                yield _sse("content_block_start", {
+                                    "type":          "content_block_start",
+                                    "index":         block_index,
+                                    "content_block": {"type": "text", "text": ""},
                                 })
+                            yield _sse("content_block_delta", {
+                                "type":  "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "text_delta", "text": references},
+                            })
 
                         # Close open blocks
                         if think_started and not think_closed:
@@ -635,6 +696,7 @@ async def create(
                     mode_id   = ModeId(selected_mode_id),
                     message   = internal_message,
                     files     = files,
+                    model_config_override = model_config_override,
                     timeout_s = timeout_s,
                 ):
                     event_type, data = classify_line(line)
@@ -707,8 +769,9 @@ async def create(
     if tool_names:
         tc_result = parse_tool_calls(full_text, tool_names)
         if tc_result.calls:
+            tool_calls = normalize_parsed_tool_calls(tc_result.calls, chat_tools)
             content: list[dict] = []
-            for call in tc_result.calls:
+            for call in tool_calls:
                 try:
                     parsed_input = orjson.loads(call.arguments)
                 except (orjson.JSONDecodeError, ValueError):
@@ -719,8 +782,8 @@ async def create(
                     "name":  call.name,
                     "input": parsed_input,
                 })
-            ct = estimate_tool_call_tokens(tc_result.calls)
-            logger.info("messages tool_calls: model={} calls={}", model, len(tc_result.calls))
+            ct = estimate_tool_call_tokens(tool_calls)
+            logger.info("messages tool_calls: model={} calls={}", model, len(tool_calls))
             return _build_message_response(msg_id, model, content, "tool_use", in_tokens, ct)
 
     logger.info(

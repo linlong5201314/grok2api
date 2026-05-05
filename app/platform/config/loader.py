@@ -30,6 +30,51 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return result
 
 
+def _set_nested(data: dict[str, Any], dotted_key: str, value: Any) -> None:
+    node = data
+    parts = dotted_key.split(".")
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            node[part] = child
+        node = child
+    node[parts[-1]] = value
+
+
+def _env_key_to_dotted(raw_key: str, known_keys: set[str]) -> str:
+    raw_norm = raw_key.lower()
+    exact = {
+        dotted.replace(".", "_"): dotted
+        for dotted in known_keys
+    }.get(raw_norm)
+    if exact:
+        return exact
+
+    parts = raw_norm.split("_")
+    for i in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:i])
+        if candidate in known_keys:
+            if i == len(parts):
+                return candidate
+            return f"{candidate}.{'_'.join(parts[i:])}"
+    if len(parts) >= 2:
+        return f"{parts[0]}.{'_'.join(parts[1:])}"
+    return parts[0]
+
+
+def _apply_env(data: dict[str, Any], env_prefix: str = "GROK_") -> dict[str, Any]:
+    known_keys = set(_flatten(data))
+    prefix_len = len(env_prefix)
+    for env_key, env_val in os.environ.items():
+        if not env_key.startswith(env_prefix):
+            continue
+        dotted_key = _env_key_to_dotted(env_key[prefix_len:], known_keys)
+        if dotted_key:
+            _set_nested(data, dotted_key, env_val)
+    return data
+
+
 def load_toml(path: Path) -> dict[str, Any]:
     """Load a TOML file and return the raw nested dict."""
     if not path.exists():
@@ -53,15 +98,7 @@ def load_config(
         user = load_toml(user_path)
         data = _deep_merge(data, user)
 
-    # Environment overrides (GROK_PROXY_BASE_PROXY_URL → proxy.base_proxy_url)
-    prefix_len = len(env_prefix)
-    for env_key, env_val in os.environ.items():
-        if not env_key.startswith(env_prefix):
-            continue
-        parts = env_key[prefix_len:].lower().split("_", 1)
-        if len(parts) == 2:
-            section, key = parts
-            data.setdefault(section, {})[key] = env_val
+    data = _apply_env(data, env_prefix)
 
     return data
 

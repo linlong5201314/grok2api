@@ -100,6 +100,22 @@ setup_logging(
 )
 
 
+def _api_keys_configured() -> bool:
+    raw = _config.get("app.api_key", "")
+    if isinstance(raw, list):
+        return any(str(key).strip() for key in raw)
+    return bool(str(raw).strip())
+
+
+def _warn_insecure_config() -> None:
+    if not _api_keys_configured():
+        logger.warning("security warning: app.api_key is empty; /v1 endpoints are unauthenticated")
+    if _config.get_str("app.app_key", "") == "grok2api":
+        logger.warning("security warning: app.app_key uses the default admin key")
+    if _config.get_bool("app.webui_enabled", False) and not _config.get_str("app.webui_key", "").strip():
+        logger.warning("security warning: WebUI is enabled without app.webui_key")
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -148,6 +164,7 @@ async def lifespan(app: FastAPI):
     )
     # Reload config in case it was just seeded/migrated into the backend.
     await _config.load()
+    _warn_insecure_config()
 
     directory = await get_account_directory(repo)
 

@@ -5,6 +5,7 @@ __pycache__
 .Python
 .env
 .env.*
+import.env
 .git
 .gitignore
 .logs

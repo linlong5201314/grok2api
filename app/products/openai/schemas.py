@@ -2,15 +2,17 @@
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MessageItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     role:         str
-    content:      str | list[dict[str, Any]] | None = None
-    tool_calls:   list[dict[str, Any]] | None       = None
-    tool_call_id: str | None                        = None
-    name:         str | None                        = None
+    content:      str | list[Any] | None = None
+    tool_calls:   list[Any] | None       = None
+    tool_call_id: str | None             = None
+    name:         str | None             = None
 
 
 class ImageConfig(BaseModel):
@@ -39,8 +41,10 @@ class ChatCompletionRequest(BaseModel):
     top_p:               float | None               = 0.95
     image_config:        ImageConfig | None         = None
     video_config:        VideoConfig | None         = None
-    tools:               list[dict[str, Any]] | None = None
+    tools:               list[Any] | None            = None
     tool_choice:         str | dict[str, Any] | None = None
+    functions:           list[Any] | None            = None
+    function_call:       str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None                = True
     max_tokens:          int | None                 = None
 
@@ -71,6 +75,9 @@ class ResponsesCreateRequest(BaseModel):
     Only model/input/instructions/stream/reasoning/temperature/top_p are acted on.
     All other fields are accepted and silently discarded.
     """
+
+    model_config = ConfigDict(extra="ignore")
+
     model:                str
     input:                str | list[Any]
     instructions:         str | None           = None
@@ -89,10 +96,6 @@ class ResponsesCreateRequest(BaseModel):
     parallel_tool_calls:  bool | None           = None
     include:              list[str] | None      = None
     background:           bool | None           = None
-
-    class Config:
-        extra = "ignore"
-
 
 __all__ = [
     "MessageItem", "ImageConfig", "VideoConfig",
