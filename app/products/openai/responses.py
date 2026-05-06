@@ -509,6 +509,33 @@ async def create(
                         logger.info("responses stream tool_calls: attempt={}/{} model={}",
                                     attempt + 1, max_retries + 1, model)
                     else:
+                        full_think = "".join(think_buf)
+                        if reasoning_started and not reasoning_closed:
+                            reasoning_closed = True
+                            yield format_sse("response.reasoning_summary_text.done", {
+                                "type":          "response.reasoning_summary_text.done",
+                                "item_id":       reasoning_id,
+                                "output_index":  0,
+                                "summary_index": 0,
+                                "text":          full_think,
+                            })
+                            yield format_sse("response.reasoning_summary_part.done", {
+                                "type":          "response.reasoning_summary_part.done",
+                                "item_id":       reasoning_id,
+                                "output_index":  0,
+                                "summary_index": 0,
+                                "part":          {"type": "summary_text", "text": full_think},
+                            })
+                            yield format_sse("response.output_item.done", {
+                                "type":         "response.output_item.done",
+                                "output_index": 0,
+                                "item":         {
+                                    "id":      reasoning_id,
+                                    "type":    "reasoning",
+                                    "summary": [{"type": "summary_text", "text": full_think}],
+                                    "status":  "completed",
+                                },
+                            })
                         # Normal text path
                         msg_idx = 1 if reasoning_started else 0
                         for url, img_id in adapter.image_urls:
@@ -596,7 +623,6 @@ async def create(
                                 },
                             })
 
-                        full_think = "".join(think_buf)
                         output = []
                         if reasoning_started and full_think:
                             output.append({
@@ -605,13 +631,14 @@ async def create(
                                 "summary": [{"type": "summary_text", "text": full_think}],
                                 "status":  "completed",
                             })
-                        output.append({
-                            "id":      message_id,
-                            "type":    "message",
-                            "role":    "assistant",
-                            "content": [{"type": "output_text", "text": full_text, "annotations": []}],
-                            "status":  "completed",
-                        })
+                        if message_started or full_text:
+                            output.append({
+                                "id":      message_id,
+                                "type":    "message",
+                                "role":    "assistant",
+                                "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+                                "status":  "completed",
+                            })
 
                         pt  = estimate_prompt_tokens(message)
                         ct  = estimate_tokens(full_text)

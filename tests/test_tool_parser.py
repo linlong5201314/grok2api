@@ -1,7 +1,9 @@
 import importlib.util
+import asyncio
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -140,6 +142,97 @@ def test_responses_function_call_output_coerces_non_string():
     assert len(messages) == 1
     assert messages[0]["role"] == "tool"
     assert json.loads(messages[0]["content"]) == {"status": "ok", "rows": [1, 2]}
+
+
+def test_responses_stream_reasoning_only_closes_reasoning_without_empty_message(monkeypatch):
+    pytest.importorskip("loguru")
+    from app.control.model.enums import ModeId
+    from app.dataplane import account as account_module
+    from app.products.openai import responses
+
+    class FakeConfig:
+        def get_int(self, *_args, **_kwargs):
+            return 0
+
+        def get_float(self, *_args, **_kwargs):
+            return 1.0
+
+        def get(self, *_args, **_kwargs):
+            return None
+
+    class FakeDirectory:
+        async def release(self, _acct):
+            return None
+
+        async def feedback(self, *_args, **_kwargs):
+            return None
+
+    class FakeStreamAdapter:
+        image_urls = []
+
+        def references_suffix(self):
+            return ""
+
+        def feed(self, data):
+            if data == "thinking":
+                return [SimpleNamespace(kind="thinking", content="hidden reasoning")]
+            return []
+
+    async def fake_reserve(*_args, **_kwargs):
+        return SimpleNamespace(token="tok"), int(ModeId.FAST)
+
+    async def fake_stream_chat(*_args, **_kwargs):
+        yield "data: thinking"
+        yield "data: [DONE]"
+
+    async def noop_async(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(account_module, "_directory", FakeDirectory())
+    monkeypatch.setattr(responses, "get_config", lambda: FakeConfig())
+    monkeypatch.setattr(responses, "StreamAdapter", FakeStreamAdapter)
+    monkeypatch.setattr(responses, "_reserve_chat_account", fake_reserve)
+    monkeypatch.setattr(responses, "_stream_chat", fake_stream_chat)
+    monkeypatch.setattr(responses, "_quota_sync", noop_async)
+    monkeypatch.setattr(responses, "_fail_sync", noop_async)
+
+    async def collect():
+        stream = await responses.create(
+            model="grok-test",
+            input_val="hello",
+            instructions=None,
+            stream=True,
+            emit_think=True,
+            temperature=0.8,
+            top_p=0.95,
+        )
+        return [chunk async for chunk in stream]
+
+    chunks = asyncio.run(collect())
+    event_names = [
+        line[len("event: "):]
+        for chunk in chunks
+        for line in chunk.splitlines()
+        if line.startswith("event: ")
+    ]
+    data_payloads = [
+        json.loads(line[len("data: "):])
+        for chunk in chunks
+        for line in chunk.splitlines()
+        if line.startswith("data: {")
+    ]
+    completed = next(payload for payload in data_payloads if payload.get("type") == "response.completed")
+    output = completed["response"]["output"]
+
+    assert "response.reasoning_summary_text.done" in event_names
+    assert "response.reasoning_summary_part.done" in event_names
+    assert any(
+        payload.get("type") == "response.output_item.done"
+        and payload.get("item", {}).get("type") == "reasoning"
+        for payload in data_payloads
+    )
+    assert [item["type"] for item in output] == ["reasoning"]
+    assert output[0]["summary"][0]["text"] == "hidden reasoning"
 
 
 def test_chat_schema_accepts_malformed_message_content_and_tool_calls():
