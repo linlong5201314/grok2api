@@ -3,6 +3,7 @@
 import base64
 import binascii
 import mimetypes
+import time
 from typing import Annotated, AsyncGenerator, AsyncIterable, Literal
 
 import orjson
@@ -10,6 +11,7 @@ from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 
 from app.control.account.state_machine import is_manageable
+from app.dataplane.shared.enums import StatusId
 from app.platform.auth.middleware import verify_api_key
 from app.platform.errors import AppError, ValidationError
 from app.platform.logging.logger import logger
@@ -35,19 +37,74 @@ _TAG_IMAGES = "OpenAI - Images"
 _TAG_VIDEOS = "OpenAI - Videos"
 _TAG_FILES = "OpenAI - Files"
 
+# Status ids that count as "manageable" (active or cooling) — mirrors
+# state_machine.is_manageable() but works directly on the int column of the
+# in-memory runtime table to avoid building AccountRecord objects.
+_MANAGEABLE_STATUS_IDS = frozenset({int(StatusId.ACTIVE), int(StatusId.COOLING)})
+
+# Cache for /v1/models pool-availability lookup.
+#
+# Why: ``_available_pools`` is hit on every ``/v1/models`` and per-model
+# ``/v1/models/{id}`` call.  SDK clients often hammer ``/v1/models`` at
+# startup.  Previously each call did a full ``runtime_snapshot()`` which
+# pulls every non-deleted row from the repository.  We now derive the set
+# from the in-memory ``AccountDirectory`` and memoise per directory
+# revision with a short TTL fallback.
+_POOLS_CACHE: dict[str, frozenset[str]] = {}
+_POOLS_CACHE_META: dict[str, tuple[int, float]] = {}  # key -> (revision, expires_at)
+_POOLS_CACHE_TTL_SECONDS = 30.0
+
+
+def _compute_available_pools(directory) -> frozenset[str]:
+    """Scan the directory's columnar table for manageable pool names."""
+    table = directory._table
+    if table is None:
+        return frozenset()
+    pools: set[str] = set()
+    status_col = table.status_by_idx
+    pool_col   = table.pool_by_idx
+    for idx in range(len(table.token_by_idx)):
+        if int(status_col[idx]) not in _MANAGEABLE_STATUS_IDS:
+            continue
+        name = _POOL_ID_TO_NAME.get(int(pool_col[idx]))
+        if name:
+            pools.add(name)
+        # Early-exit when all three known pools have been observed.
+        if len(pools) == len(_POOL_ID_TO_NAME):
+            break
+    return frozenset(pools)
+
 
 async def _available_pools(request: Request) -> frozenset[str]:
+    """Return the set of pool names with at least one manageable account.
+
+    Fast path: derive from the in-memory ``AccountDirectory`` (no DB hit) and
+    cache by ``(table.revision)`` with a 30 s TTL.
+    Slow path (directory not yet bootstrapped): fall back to a full DB
+    snapshot — same behaviour as before.
+    """
+    directory = getattr(request.app.state, "directory", None)
+    if directory is not None and directory._table is not None:
+        rev = directory.revision
+        meta = _POOLS_CACHE_META.get("default")
+        now  = time.monotonic()
+        if meta and meta[0] == rev and now < meta[1]:
+            return _POOLS_CACHE["default"]
+        pools = _compute_available_pools(directory)
+        _POOLS_CACHE["default"] = pools
+        _POOLS_CACHE_META["default"] = (rev, now + _POOLS_CACHE_TTL_SECONDS)
+        return pools
+
+    # Fallback for cold-start before the directory is ready.
     repo = getattr(request.app.state, "repository", None)
     if repo is None:
         return frozenset()
-
     snapshot = await repo.runtime_snapshot()
-    pools = {
+    return frozenset(
         record.pool
         for record in snapshot.items
         if is_manageable(record)
-    }
-    return frozenset(pools)
+    )
 
 
 def _model_available_for_pools(spec: ModelSpec, pools: frozenset[str]) -> bool:

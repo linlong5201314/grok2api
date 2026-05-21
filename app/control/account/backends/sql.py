@@ -58,6 +58,13 @@ accounts_table = sa.Table(
     sa.Column("deleted_at",       sa.BigInteger),
     sa.Column("ext",              sa.Text,    nullable=False, default="{}"),
     sa.Column("revision",         sa.BigInteger, nullable=False, default=0),
+    # Indexes — these mirror the SQLite local backend so all SQL dialects
+    # have parity.  ``metadata.create_all(checkfirst=True)`` skips creation
+    # when an index of the same name already exists.
+    sa.Index("idx_acc_revision",      "revision"),
+    sa.Index("idx_acc_pool_status",   "pool", "status"),
+    sa.Index("idx_acc_deleted_at",    "deleted_at"),
+    sa.Index("idx_acc_updated_at",    "updated_at"),
 )
 
 meta_table = sa.Table(
@@ -463,6 +470,82 @@ def _row_to_record(row: Any) -> AccountRecord:
     return AccountRecord.model_validate(d)
 
 
+def _build_patch_updates(
+    patch: AccountPatch,
+    record: AccountRecord,
+    *,
+    ts:  int,
+    rev: int,
+) -> dict[str, Any]:
+    """Build the column → value dict for a single AccountPatch.
+
+    Pure function — does not touch the DB.  Called by ``patch_accounts`` once
+    per patch after a single bulk preload of all affected records.
+    """
+    updates: dict[str, Any] = {"updated_at": ts, "revision": rev}
+
+    if patch.pool is not None:
+        updates["pool"] = patch.pool
+    if patch.status is not None:
+        updates["status"] = patch.status.value
+    if patch.state_reason is not None:
+        updates["state_reason"] = patch.state_reason
+    if patch.last_use_at is not None:
+        updates["last_use_at"] = patch.last_use_at
+    if patch.last_fail_at is not None:
+        updates["last_fail_at"] = patch.last_fail_at
+    if patch.last_fail_reason is not None:
+        updates["last_fail_reason"] = patch.last_fail_reason
+    if patch.last_sync_at is not None:
+        updates["last_sync_at"] = patch.last_sync_at
+    if patch.last_clear_at is not None:
+        updates["last_clear_at"] = patch.last_clear_at
+    if patch.quota_auto is not None:
+        updates["quota_auto"] = json.dumps(patch.quota_auto)
+    if patch.quota_fast is not None:
+        updates["quota_fast"] = json.dumps(patch.quota_fast)
+    if patch.quota_expert is not None:
+        updates["quota_expert"] = json.dumps(patch.quota_expert)
+    if patch.quota_heavy is not None:
+        updates["quota_heavy"] = json.dumps(patch.quota_heavy)
+    if patch.usage_use_delta is not None:
+        updates["usage_use_count"] = max(0, record.usage_use_count + patch.usage_use_delta)
+    if patch.usage_fail_delta is not None:
+        updates["usage_fail_count"] = max(0, record.usage_fail_count + patch.usage_fail_delta)
+    if patch.usage_sync_delta is not None:
+        updates["usage_sync_count"] = max(0, record.usage_sync_count + patch.usage_sync_delta)
+
+    tags = list(record.tags)
+    if patch.tags is not None:
+        tags = list(patch.tags)
+    if patch.add_tags:
+        for t in patch.add_tags:
+            if t not in tags:
+                tags.append(t)
+    if patch.remove_tags:
+        tags = [t for t in tags if t not in patch.remove_tags]
+    updates["tags"] = json.dumps(tags)
+
+    ext = dict(record.ext)
+    if patch.ext_merge:
+        ext.update(patch.ext_merge)
+    if patch.clear_failures:
+        for k in (
+            "cooldown_until", "cooldown_reason", "disabled_at",
+            "disabled_reason", "expired_at", "expired_reason",
+            "forbidden_strikes",
+        ):
+            ext.pop(k, None)
+        updates["status"]           = AccountStatus.ACTIVE.value
+        updates["usage_fail_count"] = 0
+        updates["last_fail_at"]     = None
+        updates["last_fail_reason"] = None
+        updates["state_reason"]     = None
+    updates["ext"] = json.dumps(ext)
+
+    return updates
+
+
 class SqlAccountRepository:
     """Async SQLAlchemy-based repository for MySQL / PostgreSQL."""
 
@@ -652,85 +735,69 @@ class SqlAccountRepository:
         self,
         patches: list[AccountPatch],
     ) -> AccountMutationResult:
+        """Apply partial updates with grouped batch execution.
+
+        Performance:
+          - One ``SELECT ... WHERE token IN (...)`` to fetch all current
+            records (was: one SELECT per patch — N round-trips).
+          - Patches that touch the same column set are grouped together and
+            executed via ``conn.execute(stmt, [params...])`` so SQLAlchemy
+            emits a single executemany (was: one UPDATE round-trip per patch).
+
+        Net effect for a uniform bulk patch (e.g. NSFW tagging 100 tokens):
+          before: 1 + 2N round-trips (~201 for N=100)
+          after:  3 round-trips (revision bump, IN-SELECT, executemany)
+        """
         if not patches:
             return AccountMutationResult()
         await self._ensure_initialized()
+
+        # Deduplicate tokens for the preload SELECT — patches with duplicate
+        # tokens are rare but allowed; preload should still issue one query.
+        unique_tokens = list({p.token for p in patches})
+
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
+
+            # Preload current state in one IN query.
+            rows = (await conn.execute(
+                sa.select(accounts_table).where(
+                    accounts_table.c.token.in_(unique_tokens)
+                )
+            )).fetchall()
+            record_by_token: dict[str, AccountRecord] = {}
+            for r in rows:
+                rec = _row_to_record(r)
+                record_by_token[rec.token] = rec
+
+            # Group patches by their write-column signature so we can issue
+            # one executemany per group.
+            groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
             count = 0
             for patch in patches:
-                row = (await conn.execute(
-                    sa.select(accounts_table).where(accounts_table.c.token == patch.token)
-                )).fetchone()
-                if row is None:
+                record = record_by_token.get(patch.token)
+                if record is None:
                     continue
-                record = _row_to_record(row)
-
-                updates: dict[str, Any] = {"updated_at": ts, "revision": rev}
-                if patch.pool is not None:
-                    updates["pool"] = patch.pool
-                if patch.status is not None:
-                    updates["status"] = patch.status.value
-                if patch.state_reason is not None:
-                    updates["state_reason"] = patch.state_reason
-                if patch.last_use_at is not None:
-                    updates["last_use_at"] = patch.last_use_at
-                if patch.last_fail_at is not None:
-                    updates["last_fail_at"] = patch.last_fail_at
-                if patch.last_fail_reason is not None:
-                    updates["last_fail_reason"] = patch.last_fail_reason
-                if patch.last_sync_at is not None:
-                    updates["last_sync_at"] = patch.last_sync_at
-                if patch.last_clear_at is not None:
-                    updates["last_clear_at"] = patch.last_clear_at
-                if patch.quota_auto is not None:
-                    updates["quota_auto"] = json.dumps(patch.quota_auto)
-                if patch.quota_fast is not None:
-                    updates["quota_fast"] = json.dumps(patch.quota_fast)
-                if patch.quota_expert is not None:
-                    updates["quota_expert"] = json.dumps(patch.quota_expert)
-                if patch.quota_heavy is not None:
-                    updates["quota_heavy"] = json.dumps(patch.quota_heavy)
-                if patch.usage_use_delta is not None:
-                    updates["usage_use_count"] = max(0, record.usage_use_count + patch.usage_use_delta)
-                if patch.usage_fail_delta is not None:
-                    updates["usage_fail_count"] = max(0, record.usage_fail_count + patch.usage_fail_delta)
-                if patch.usage_sync_delta is not None:
-                    updates["usage_sync_count"] = max(0, record.usage_sync_count + patch.usage_sync_delta)
-
-                tags = list(record.tags)
-                if patch.tags is not None:
-                    tags = patch.tags
-                if patch.add_tags:
-                    for t in patch.add_tags:
-                        if t not in tags:
-                            tags.append(t)
-                if patch.remove_tags:
-                    tags = [t for t in tags if t not in patch.remove_tags]
-                updates["tags"] = json.dumps(tags)
-
-                ext = dict(record.ext)
-                if patch.ext_merge:
-                    ext.update(patch.ext_merge)
-                if patch.clear_failures:
-                    for k in ("cooldown_until", "cooldown_reason", "disabled_at",
-                              "disabled_reason", "expired_at", "expired_reason",
-                              "forbidden_strikes"):
-                        ext.pop(k, None)
-                    updates["status"]           = AccountStatus.ACTIVE.value
-                    updates["usage_fail_count"] = 0
-                    updates["last_fail_at"]     = None
-                    updates["last_fail_reason"] = None
-                    updates["state_reason"]     = None
-                updates["ext"] = json.dumps(ext)
-
-                await conn.execute(
-                    accounts_table.update()
-                    .where(accounts_table.c.token == patch.token)
-                    .values(**updates)
-                )
+                updates = _build_patch_updates(patch, record, ts=ts, rev=rev)
+                sig = tuple(sorted(updates.keys()))
+                groups.setdefault(sig, []).append({**updates, "_token": patch.token})
                 count += 1
+
+            # Emit one UPDATE per signature group.  For a single-row group
+            # SQLAlchemy still uses the regular execute path; multi-row groups
+            # become executemany.
+            for sig, params_list in groups.items():
+                stmt = (
+                    accounts_table.update()
+                    .where(accounts_table.c.token == sa.bindparam("_token"))
+                    .values({col: sa.bindparam(col) for col in sig})
+                )
+                if len(params_list) == 1:
+                    await conn.execute(stmt, params_list[0])
+                else:
+                    await conn.execute(stmt, params_list)
+
             return AccountMutationResult(patched=count, revision=rev)
 
     async def delete_accounts(

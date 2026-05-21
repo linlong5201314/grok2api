@@ -244,6 +244,76 @@ async def force_sync():
     )
 
 
+@router.get("/overview", tags=[_TAG_ADMIN_SYSTEM])
+async def overview():
+    """Aggregate counters built from the in-memory account directory.
+
+    Zero DB hits — reads the columnar runtime table directly so the admin
+    dashboard "概览" panel can render before the full account list arrives.
+    """
+    from app.dataplane.account import _directory
+    from app.dataplane.shared.enums import PoolId, StatusId
+
+    if _directory is None or _directory._table is None:
+        raise AppError(
+            "Account directory not initialised",
+            kind=ErrorKind.SERVER,
+            code="directory_not_initialised",
+            status=503,
+        )
+
+    table = _directory._table
+    pool_id_to_name = {
+        int(PoolId.BASIC): "basic",
+        int(PoolId.SUPER): "super",
+        int(PoolId.HEAVY): "heavy",
+    }
+    status_id_to_name = {
+        int(StatusId.ACTIVE):   "active",
+        int(StatusId.COOLING):  "cooling",
+        int(StatusId.EXPIRED):  "expired",
+        int(StatusId.DISABLED): "disabled",
+    }
+    deleted_id = int(StatusId.DELETED)
+
+    pool_counts:   dict[str, int] = {name: 0 for name in pool_id_to_name.values()}
+    status_counts: dict[str, int] = {name: 0 for name in status_id_to_name.values()}
+    total = 0
+    nsfw_idxs = table.tag_idx.get("nsfw", set())
+    nsfw_on   = 0
+
+    status_col = table.status_by_idx
+    pool_col   = table.pool_by_idx
+    for idx in range(len(table.token_by_idx)):
+        sid = int(status_col[idx])
+        if sid == deleted_id:
+            continue
+        total += 1
+        status_name = status_id_to_name.get(sid, "expired")
+        status_counts[status_name] = status_counts.get(status_name, 0) + 1
+        pool_name = pool_id_to_name.get(int(pool_col[idx]))
+        if pool_name:
+            pool_counts[pool_name] = pool_counts.get(pool_name, 0) + 1
+
+    nsfw_on = sum(
+        1
+        for idx in nsfw_idxs
+        if int(status_col[idx]) != deleted_id
+    )
+
+    payload = {
+        "revision":       _directory.revision,
+        "total":          total,
+        "pool_counts":    pool_counts,
+        "status_counts":  status_counts,
+        "nsfw_counts": {
+            "enabled":  nsfw_on,
+            "disabled": max(0, total - nsfw_on),
+        },
+    }
+    return Response(content=orjson.dumps(payload), media_type="application/json")
+
+
 compat_router = APIRouter(prefix="/api/v1/admin", dependencies=[Depends(verify_admin_key)])
 compat_router.include_router(_tokens_router)
 compat_router.include_router(_batch_router)
@@ -255,6 +325,7 @@ compat_router.add_api_route("/config", update_config, methods=["POST"], tags=[_T
 compat_router.add_api_route("/storage", get_storage_mode, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
 compat_router.add_api_route("/status", runtime_status, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
 compat_router.add_api_route("/sync", force_sync, methods=["POST"], tags=[_TAG_ADMIN_SYSTEM])
+compat_router.add_api_route("/overview", overview, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
 
 
 __all__ = ["router", "compat_router", "get_repo", "get_refresh_svc"]

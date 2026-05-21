@@ -1135,6 +1135,11 @@ async function _api(method, path, body) {
 
 // ── Load ───────────────────────────────────────────────────────────────────
 async function load() {
+  // Render the 概览 panel immediately from /overview (no DB hit — served from
+  // the in-memory account directory) so users see real numbers within ~50 ms
+  // instead of waiting for the full /tokens fetch to finish.
+  _renderOverviewSkeleton();
+  _api('GET', '/overview').then(applyOverview).catch(() => {});
   try {
     const data = await _api('GET', '/tokens');
     allTokens = Array.isArray(data.tokens)
@@ -1144,6 +1149,25 @@ async function load() {
     invalidateTokenView();
     render();
   } catch (e) { showToast(`${tr('account.loadFailed', null, '加载失败')}: ${e.message}`, 'error'); }
+}
+
+function _renderOverviewSkeleton() {
+  // Show a dash placeholder while the overview request is in-flight so the
+  // panel does not flash "0" on every page load.
+  ['s-total','s-active','s-cooling','s-invalid','s-disabled'].forEach(id => $(id, '—'));
+}
+
+function applyOverview(data) {
+  // Only apply when the full token list hasn't already populated the stats
+  // (avoid clobbering more accurate counts derived from allTokens).
+  if (allTokens.length) return;
+  if (!data || typeof data !== 'object') return;
+  const status = data.status_counts || {};
+  $('s-total',    data.total || 0);
+  $('s-active',   status.active   || 0);
+  $('s-cooling',  status.cooling  || 0);
+  $('s-invalid',  status.expired  || 0);
+  $('s-disabled', status.disabled || 0);
 }
 
 // ── Render ─────────────────────────────────────────────────────────────────
