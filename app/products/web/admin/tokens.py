@@ -23,7 +23,6 @@ from app.control.account.commands import (
     AccountPatch,
     AccountUpsert,
     BulkReplacePoolCommand,
-    ListAccountsQuery,
 )
 from app.control.account.enums import AccountStatus
 
@@ -156,6 +155,7 @@ def _serialize_record(r) -> dict:
         "heavy_quota": _quota_remaining(quota, "heavy"),
         "heavy_quota_known": _quota_window_known(quota, "heavy"),
         "use_count":   r.usage_use_count or 0,
+        "fail_count":  r.usage_fail_count or 0,
         "last_used_at": r.last_use_at,
         "tags":        r.tags or [],
     }
@@ -172,17 +172,14 @@ def _json(data) -> Response:
 
 @router.get("/tokens")
 async def list_tokens(repo: "AccountRepository" = Depends(get_repo)):
-    """Return flat token list."""
-    all_items: list = []
-    page_num = 1
-    while True:
-        page = await repo.list_accounts(ListAccountsQuery(page=page_num, page_size=2000))
-        all_items.extend(page.items)
-        if page_num * 2000 >= page.total:
-            break
-        page_num += 1
+    """Return flat token list.
 
-    return _json({"tokens": [_serialize_record(r) for r in all_items]})
+    Uses runtime_snapshot() — a single backend scan — instead of repeatedly
+    paging through list_accounts().  For the Redis backend in particular this
+    avoids re-scanning all record keys on every page.
+    """
+    snapshot = await repo.runtime_snapshot()
+    return _json({"tokens": [_serialize_record(r) for r in snapshot.items]})
 
 
 @router.post("/tokens")

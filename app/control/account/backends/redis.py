@@ -124,6 +124,29 @@ class RedisAccountRepository:
     async def _bump_revision(self) -> int:
         return int(await self._r.incr(_KEY_REV))
 
+    async def _pipeline_hgetall(
+        self,
+        keys: list[str],
+        *,
+        chunk: int = 500,
+    ) -> list[dict]:
+        """Batch HGETALL via pipeline to minimise round-trips.
+
+        Returns one dict per key, preserving order.  Empty dict for missing keys.
+        Splits into chunks to bound pipeline memory.
+        """
+        if not keys:
+            return []
+        results: list[dict] = []
+        for i in range(0, len(keys), chunk):
+            batch = keys[i : i + chunk]
+            async with self._r.pipeline(transaction=False) as pipe:
+                for key in batch:
+                    pipe.hgetall(key)
+                batch_results = await pipe.execute()
+            results.extend(batch_results)
+        return results
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -142,12 +165,12 @@ class RedisAccountRepository:
         async for k in self._r.scan_iter("accounts:record:*"):
             keys.append(k.decode() if isinstance(k, bytes) else k)
 
+        hashes = await self._pipeline_hgetall(keys)
         items: list[AccountRecord] = []
-        for key in keys:
-            token = key.split(":", 2)[-1]
-            h = await self._r.hgetall(key)
+        for key, h in zip(keys, hashes):
             if not h:
                 continue
+            token = key.split(":", 2)[-1]
             record = self._from_hash(token, h)
             if not record.is_deleted():
                 items.append(record)
@@ -356,12 +379,16 @@ class RedisAccountRepository:
         query: ListAccountsQuery,
     ) -> AccountPage:
         # Full scan — Redis is not optimised for filtered listing.
-        all_records: list[AccountRecord] = []
+        keys: list[str] = []
         async for key in self._r.scan_iter("accounts:record:*"):
-            token = (key.decode() if isinstance(key, bytes) else key).split(":", 2)[-1]
-            h = await self._r.hgetall(key)
+            keys.append(key.decode() if isinstance(key, bytes) else key)
+
+        hashes = await self._pipeline_hgetall(keys)
+        all_records: list[AccountRecord] = []
+        for key, h in zip(keys, hashes):
             if not h:
                 continue
+            token = key.split(":", 2)[-1]
             r = self._from_hash(token, h)
             if not query.include_deleted and r.is_deleted():
                 continue
