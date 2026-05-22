@@ -7,16 +7,22 @@ from ..models import ClearanceBundle, ClearanceMode
 class ManualClearanceProvider:
     """Build a ClearanceBundle from static config values."""
 
-    def build_bundle(self, *, affinity_key: str) -> ClearanceBundle | None:
+    def build_bundle(
+        self,
+        *,
+        affinity_key: str,
+        clearance_host: str = "grok.com",
+    ) -> ClearanceBundle | None:
         cfg = get_config()
         mode = ClearanceMode.parse(cfg.get_str("proxy.clearance.mode", "none"))
         if mode != ClearanceMode.MANUAL:
             return None
         return ClearanceBundle(
-            bundle_id    = f"manual:{affinity_key}",
+            bundle_id    = f"manual:{affinity_key}@{clearance_host}",
             cf_cookies   = cfg.get_str("proxy.clearance.cf_cookies", ""),
             user_agent   = cfg.get_str("proxy.clearance.user_agent", ""),
             affinity_key = affinity_key,
+            clearance_host = clearance_host,
         )
 
 

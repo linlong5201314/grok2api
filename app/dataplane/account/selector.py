@@ -54,6 +54,31 @@ def select(
     return _best(table, working, mode_id, quota_col, now_s)
 
 
+def select_any(
+    table: AccountRuntimeTable,
+    pool_id: int,
+    *,
+    exclude_idxs: frozenset[int] | None = None,
+    prefer_tag_idxs: set[int] | None = None,
+    now_s: int,
+) -> int | None:
+    candidates = _pool_union(table, pool_id)
+    if not candidates:
+        return None
+
+    working = candidates.copy()
+    if exclude_idxs:
+        working -= exclude_idxs
+    if not working:
+        return None
+
+    if prefer_tag_idxs:
+        preferred = working & prefer_tag_idxs
+        working = preferred if preferred else working
+
+    return _best_no_quota(table, working, now_s)
+
+
 def _maybe_reset_windows(
     table:     AccountRuntimeTable,
     candidates: set[int],
@@ -137,4 +162,44 @@ def _best(
     return best_idx
 
 
-__all__ = ["select"]
+def _best_no_quota(
+    table: AccountRuntimeTable,
+    working: set[int],
+    now_s: int,
+) -> int | None:
+    best_idx = -1
+    best_score = -1e18
+
+    health_col = table.health_by_idx
+    inflight_col = table.inflight_by_idx
+    fail_col = table.fail_count_by_idx
+    last_use_col = table.last_use_at_by_idx
+
+    for idx in working:
+        health = float(health_col[idx])
+        inflight = int(inflight_col[idx])
+        fails = min(int(fail_col[idx]), 10)
+        last_use = int(last_use_col[idx])
+
+        score = health * _W_HEALTH - inflight * _W_INFLIGHT - fails * _W_FAIL
+        if last_use > 0:
+            age_s = now_s - last_use
+            if age_s < _RECENT_WINDOW_S:
+                score -= (1.0 - age_s / _RECENT_WINDOW_S) * _W_RECENT
+
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    return best_idx if best_idx >= 0 else None
+
+
+def _pool_union(table: AccountRuntimeTable, pool_id: int) -> set[int]:
+    out: set[int] = set()
+    for (pid, _mid), accounts in table.mode_available.items():
+        if pid == pool_id:
+            out |= accounts
+    return out
+
+
+__all__ = ["select", "select_any"]

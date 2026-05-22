@@ -284,9 +284,8 @@ async def generate(
             chat_format     = chat_format,
         )
 
-    acct = await _acct_dir.reserve(
+    acct = await _acct_dir.reserve_any(
         pool_candidates = spec.pool_candidates(),
-        mode_id         = int(spec.mode_id),
         now_s_override  = now_s(),
     )
     if acct is None:
@@ -295,6 +294,7 @@ async def generate(
     token       = acct.token
     response_id = make_response_id()
     enable_pro  = model in _PRO_IMAGE_MODELS
+    ws_mode_id  = int(spec.mode_id)
 
     if stream:
         async def _sse_stream() -> AsyncGenerator[str, None]:
@@ -362,12 +362,10 @@ async def generate(
                 raise
             finally:
                 await _acct_dir.release(acct)
-                kind = FeedbackKind.SUCCESS if success else _feedback_kind(fail_exc) if fail_exc else FeedbackKind.SERVER_ERROR
-                await _acct_dir.feedback(token, kind, int(spec.mode_id))
-                if success:
-                    asyncio.create_task(_quota_sync(token, int(spec.mode_id)))
-                else:
-                    asyncio.create_task(_fail_sync(token, int(spec.mode_id), fail_exc))
+                if not success and fail_exc is not None:
+                    kind = _feedback_kind(fail_exc)
+                    if kind in (FeedbackKind.UNAUTHORIZED, FeedbackKind.FORBIDDEN):
+                        await _acct_dir.feedback(token, kind, ws_mode_id)
 
         return _sse_stream()
 
@@ -429,12 +427,10 @@ async def generate(
         raise
     finally:
         await _acct_dir.release(acct)
-        kind = FeedbackKind.SUCCESS if success else _feedback_kind(fail_exc) if fail_exc else FeedbackKind.SERVER_ERROR
-        await _acct_dir.feedback(token, kind, int(spec.mode_id))
-        if success:
-            asyncio.create_task(_quota_sync(token, int(spec.mode_id)))
-        else:
-            asyncio.create_task(_fail_sync(token, int(spec.mode_id), fail_exc))
+        if not success and fail_exc is not None:
+            kind = _feedback_kind(fail_exc)
+            if kind in (FeedbackKind.UNAUTHORIZED, FeedbackKind.FORBIDDEN):
+                await _acct_dir.feedback(token, kind, ws_mode_id)
 
     if chat_format:
         content = "\n\n".join(image.markdown_value for image in finals)

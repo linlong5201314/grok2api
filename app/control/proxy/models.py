@@ -76,6 +76,7 @@ class ClearanceBundle(BaseModel):
     user_agent:      str            = ""
     state:           ClearanceBundleState = ClearanceBundleState.VALID
     affinity_key:    str            = ""  # associates bundle with an egress node
+    clearance_host:  str            = "grok.com"
     last_refresh_at: int | None     = None  # ms
 
 
@@ -84,6 +85,7 @@ class ProxyLease(BaseModel):
     proxy_url:   str | None    = None
     cf_cookies:  str           = ""
     user_agent:  str           = ""
+    clearance_host: str        = "grok.com"
     scope:       ProxyScope    = ProxyScope.APP
     kind:        RequestKind   = RequestKind.HTTP
     acquired_at: int           = 0   # ms

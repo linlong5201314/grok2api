@@ -6,7 +6,7 @@ configuration loading and clearance refresh lifecycle.
 """
 
 import asyncio
-from typing import Sequence
+from urllib.parse import urlparse
 
 from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
@@ -21,6 +21,15 @@ from .providers.manual import ManualClearanceProvider
 from .providers.flaresolverr import FlareSolverrClearanceProvider
 
 
+BundleKey = tuple[str, str]
+_DEFAULT_CLEARANCE_ORIGIN = "https://grok.com"
+
+
+def _clearance_host(origin: str | None) -> str:
+    host = (urlparse(origin or _DEFAULT_CLEARANCE_ORIGIN).hostname or "").lower()
+    return host or "grok.com"
+
+
 class ProxyDirectory:
     """Owns egress nodes and clearance bundles.
 
@@ -30,11 +39,11 @@ class ProxyDirectory:
     def __init__(self) -> None:
         self._nodes:          list[EgressNode]          = []
         self._resource_nodes: list[EgressNode]          = []  # for media downloads
-        self._bundles:        dict[str, ClearanceBundle] = {}
+        self._bundles:        dict[BundleKey, ClearanceBundle] = {}
         self._lock            = asyncio.Lock()
         # Single-flight guard: at most one FlareSolverr call per affinity key.
         # Other coroutines wait on the Event until the active refresh completes.
-        self._refresh_events: dict[str, asyncio.Event]  = {}
+        self._refresh_events: dict[BundleKey, asyncio.Event]  = {}
         self._manual          = ManualClearanceProvider()
         self._flare           = FlareSolverrClearanceProvider()
         self._egress_mode:    EgressMode    = EgressMode.DIRECT
@@ -105,12 +114,12 @@ class ProxyDirectory:
             self._bundles = {
                 key: bundle.model_copy(update={"state": ClearanceBundleState.INVALID})
                 for key, bundle in self._bundles.items()
-                if key in valid_affinities
+                if key[0] in valid_affinities
             }
             self._refresh_events = {
                 key: event
                 for key, event in self._refresh_events.items()
-                if key in valid_affinities
+                if key[0] in valid_affinities
             }
             self._config_sig = config_sig
 
@@ -132,6 +141,7 @@ class ProxyDirectory:
         scope:    ProxyScope  = ProxyScope.APP,
         kind:     RequestKind = RequestKind.HTTP,
         resource: bool        = False,
+        clearance_origin: str | None = None,
     ) -> ProxyLease:
         """Return a ProxyLease for the next request.
 
@@ -139,14 +149,21 @@ class ProxyDirectory:
         """
         proxy_url = await self._pick_proxy_url(resource=resource)
         affinity  = proxy_url or "direct"
+        clearance_origin = clearance_origin or _DEFAULT_CLEARANCE_ORIGIN
+        clearance_host = _clearance_host(clearance_origin)
 
-        bundle = await self._get_or_build_bundle(affinity_key=affinity, proxy_url=proxy_url or "")
+        bundle = await self._get_or_build_bundle(
+            affinity_key=affinity,
+            proxy_url=proxy_url or "",
+            clearance_origin=clearance_origin,
+        )
 
         return ProxyLease(
             lease_id    = next_hex(),
             proxy_url   = proxy_url,
             cf_cookies  = bundle.cf_cookies if bundle else "",
             user_agent  = bundle.user_agent if bundle else "",
+            clearance_host = clearance_host,
             scope       = scope,
             kind        = kind,
             acquired_at = now_ms(),
@@ -159,12 +176,12 @@ class ProxyDirectory:
             ProxyFeedbackKind.UNAUTHORIZED,
         ):
             # Invalidate associated clearance bundle.
-            affinity = lease.proxy_url or "direct"
+            key = (lease.proxy_url or "direct", lease.clearance_host or "grok.com")
             async with self._lock:
-                bundle = self._bundles.get(affinity)
+                bundle = self._bundles.get(key)
                 if bundle:
                     from .models import ClearanceBundleState
-                    self._bundles[affinity] = bundle.model_copy(
+                    self._bundles[key] = bundle.model_copy(
                         update={"state": ClearanceBundleState.INVALID}
                     )
 
@@ -212,41 +229,48 @@ class ProxyDirectory:
         *,
         affinity_key: str,
         proxy_url:    str,
+        clearance_origin: str,
     ) -> ClearanceBundle | None:
         if self._clearance_mode == ClearanceMode.NONE:
             return None
+        clearance_host = _clearance_host(clearance_origin)
+        key: BundleKey = (affinity_key, clearance_host)
 
         # Single-flight: only one coroutine fetches clearance per affinity key.
         # Concurrent callers wait on the Event and retry once it fires.
         while True:
             async with self._lock:
-                bundle = self._bundles.get(affinity_key)
+                bundle = self._bundles.get(key)
                 if bundle and bundle.state.value == 0:   # VALID
                     return bundle
-                event = self._refresh_events.get(affinity_key)
+                event = self._refresh_events.get(key)
                 if event is None:
                     # This coroutine wins the right to refresh.
                     event = asyncio.Event()
-                    self._refresh_events[affinity_key] = event
+                    self._refresh_events[key] = event
                     break
             # Another coroutine is already refreshing — wait for it, then retry.
             await event.wait()
 
         try:
             if self._clearance_mode == ClearanceMode.MANUAL:
-                bundle = self._manual.build_bundle(affinity_key=affinity_key)
+                bundle = self._manual.build_bundle(
+                    affinity_key=affinity_key,
+                    clearance_host=clearance_host,
+                )
             else:
                 bundle = await self._flare.refresh_bundle(
                     affinity_key = affinity_key,
                     proxy_url    = proxy_url,
+                    target_url   = clearance_origin,
                 )
             if bundle:
                 async with self._lock:
-                    self._bundles[affinity_key] = bundle
+                    self._bundles[key] = bundle
             return bundle
         finally:
             async with self._lock:
-                self._refresh_events.pop(affinity_key, None)
+                self._refresh_events.pop(key, None)
             event.set()  # Wake all waiters so they retry with the new bundle.
 
     # ------------------------------------------------------------------
@@ -286,6 +310,7 @@ class ProxyDirectory:
             await self._get_or_build_bundle(
                 affinity_key = affinity,
                 proxy_url    = proxy_url,
+                clearance_origin = _DEFAULT_CLEARANCE_ORIGIN,
             )
 
     async def refresh_clearance_safe(self) -> None:
@@ -300,29 +325,40 @@ class ProxyDirectory:
             return
         async with self._lock:
             nodes    = list(self._nodes)
-            existing = set(self._bundles.keys())
+            existing = list(self._bundles.keys())
 
-        affinity_items = (
+        default_items = (
             [(n.proxy_url or "direct", n.proxy_url or "") for n in nodes]
             if nodes
             else [("direct", "")]
         )
-        # Also refresh bundles for keys that no longer have a matching node
-        # (e.g. pool was reconfigured) so stale entries get cleaned up.
-        all_keys = {a for a, _ in affinity_items} | existing
+        refresh_targets: dict[BundleKey, tuple[str, str]] = {
+            (affinity, _clearance_host(_DEFAULT_CLEARANCE_ORIGIN)): (proxy_url, _DEFAULT_CLEARANCE_ORIGIN)
+            for affinity, proxy_url in default_items
+        }
+        for key in existing:
+            affinity, clearance_host = key
+            refresh_targets.setdefault(
+                key,
+                ("" if affinity == "direct" else affinity, f"https://{clearance_host}"),
+            )
 
-        for affinity in all_keys:
-            proxy_url = "" if affinity == "direct" else affinity
+        for key, (proxy_url, clearance_origin) in refresh_targets.items():
+            affinity, clearance_host = key
             if self._clearance_mode == ClearanceMode.MANUAL:
-                new_bundle = self._manual.build_bundle(affinity_key=affinity)
+                new_bundle = self._manual.build_bundle(
+                    affinity_key=affinity,
+                    clearance_host=clearance_host,
+                )
             else:
                 new_bundle = await self._flare.refresh_bundle(
                     affinity_key = affinity,
                     proxy_url    = proxy_url,
+                    target_url   = clearance_origin,
                 )
             if new_bundle:
                 async with self._lock:
-                    self._bundles[affinity] = new_bundle
+                    self._bundles[key] = new_bundle
                 logger.debug("clearance bundle refreshed: affinity={}", affinity)
             else:
                 logger.warning(
@@ -351,7 +387,7 @@ class ProxyDirectory:
         return list(self._nodes)
 
     @property
-    def bundles(self) -> dict[str, ClearanceBundle]:
+    def bundles(self) -> dict[BundleKey, ClearanceBundle]:
         """Read-only snapshot of the current clearance bundles."""
         return dict(self._bundles)
 

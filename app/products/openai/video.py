@@ -204,32 +204,33 @@ def _video_create_payload(
     resolution_name: str,
     video_length: int,
     preset: str,
-    reference_content_url: str | None = None,
-    file_attachments: list[str] | None = None,
+    image_references: list[str] | None = None,
 ) -> dict[str, Any]:
-    payload = {
+    video_gen_config: dict[str, Any] = {
+        "parentPostId": parent_post_id,
+        "aspectRatio": aspect_ratio,
+        "videoLength": video_length,
+        "resolutionName": resolution_name,
+    }
+    if image_references:
+        video_gen_config["isVideoEdit"] = False
+        video_gen_config["isReferenceToVideo"] = True
+        video_gen_config["imageReferences"] = image_references
+    return {
         "temporary": True,
         "modelName": _VIDEO_MODEL_NAME,
-        "message": _build_message(prompt, preset, reference_content_url=reference_content_url),
+        "message": _build_message(prompt, preset),
         "toolOverrides": {"videoGen": True},
         "enableSideBySide": True,
         "responseMetadata": {
             "experiments": [],
             "modelConfigOverride": {
                 "modelMap": {
-                    "videoGenModelConfig": {
-                        "parentPostId": parent_post_id,
-                        "aspectRatio": aspect_ratio,
-                        "videoLength": video_length,
-                        "resolutionName": resolution_name,
-                    }
+                    "videoGenModelConfig": video_gen_config
                 }
             },
         },
     }
-    if file_attachments:
-        payload["fileAttachments"] = file_attachments
-    return payload
 
 
 def _video_extend_start_time(seconds: int) -> float:
@@ -400,6 +401,51 @@ async def _prepare_video_reference(token: str, input_reference: dict[str, Any]) 
     return _VideoReference(content_url=content_url, post_id=post_id)
 
 
+async def _prepare_video_references(
+    token: str,
+    input_references: list[dict[str, Any]],
+) -> list[_VideoReference]:
+    tasks = [
+        _prepare_video_reference(token, ref)
+        for ref in input_references
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    failures: list[tuple[int, BaseException]] = [
+        (index, result)
+        for index, result in enumerate(results)
+        if isinstance(result, BaseException)
+    ]
+    if failures:
+        index, exc = failures[0]
+        message = f"Video input reference {index + 1} failed: {_exception_message(exc)}"
+        if len(failures) > 1:
+            message += f" ({len(failures)} references failed)"
+        if isinstance(exc, ValidationError):
+            raise ValidationError(message, param=exc.param) from exc
+        if isinstance(exc, UpstreamError):
+            raise UpstreamError(
+                message,
+                status=exc.status,
+                body=exc.details.get("body", ""),
+            ) from exc
+        raise UpstreamError(message) from exc
+
+    return [r for r in results if isinstance(r, _VideoReference)]
+
+
+def _exception_message(exc: BaseException) -> str:
+    if isinstance(exc, BaseExceptionGroup):
+        messages = [
+            _exception_message(child)
+            for child in exc.exceptions
+            if not isinstance(child, asyncio.CancelledError)
+        ]
+        return "; ".join(message for message in messages if message) or str(exc)
+    if isinstance(exc, AppError):
+        return exc.message
+    return str(exc)
+
+
 async def _collect_video_segment(
     *,
     token: str,
@@ -486,7 +532,12 @@ async def _download_video_bytes(token: str, url: str) -> tuple[bytes, str]:
         raise
     except Exception as exc:
         raise UpstreamError(f"Video download failed: {exc}") from exc
-    return b"".join(chunks), (content_type or "video/mp4")
+    raw = b"".join(chunks)
+    if not raw:
+        raise UpstreamError("Video download returned empty content", status=502)
+    if raw.lstrip()[:1] in {b"<", b"{"}:
+        raise UpstreamError("Video download returned non-video content", status=502)
+    return raw, (content_type or "video/mp4")
 
 
 def _save_video_bytes(raw: bytes, file_id: str) -> Path:
@@ -522,9 +573,9 @@ async def _resolve_video_output(*, token: str, url: str, file_id: str) -> str:
 
     try:
         raw, _mime = await _download_video_bytes(token, url)
-        _save_video_bytes(raw, file_id)
+        await asyncio.to_thread(_save_video_bytes, raw, file_id)
     except Exception as exc:
-        logger.warning("video download failed: fallback_to=upstream_url error={}", exc)
+        logger.debug("video download fallback_to=upstream_url error={}", exc)
         return url if fmt == "local_url" else _render_video_html(url)
 
     local_url = _local_video_url(file_id)
@@ -540,13 +591,13 @@ async def _generate_video_with_token(
     seconds: int,
     preset: str,
     timeout_s: float,
-    input_reference: dict[str, Any] | None = None,
+    input_references: list[dict[str, Any]] | None = None,
     progress_cb: Callable[[int], Awaitable[None]] | None = None,
 ) -> _VideoArtifact:
-    reference: _VideoReference | None = None
-    if input_reference:
-        reference = await _prepare_video_reference(token, input_reference)
-        parent_post_id = reference.post_id
+    references: list[_VideoReference] = []
+    if input_references:
+        references = await _prepare_video_references(token, input_references)
+        parent_post_id = references[0].post_id
     else:
         post = await create_media_post(
             token,
@@ -576,8 +627,7 @@ async def _generate_video_with_token(
                 resolution_name=resolution_name,
                 video_length=segment_length,
                 preset=preset,
-                reference_content_url=reference.content_url if reference is not None else None,
-                file_attachments=[reference.post_id] if reference is not None else None,
+                image_references=[r.content_url for r in references] if references else None,
             )
             referer = "https://grok.com/imagine"
         else:
@@ -624,7 +674,7 @@ async def _run_video_generation(
     resolution_name: str,
     seconds: int,
     preset: str = "custom",
-    input_reference: dict[str, Any] | None = None,
+    input_references: list[dict[str, Any]] | None = None,
     progress_cb: Callable[[int], Awaitable[None]] | None = None,
 ) -> _VideoArtifact:
     async def _runner(token: str, timeout_s: float) -> _VideoArtifact:
@@ -636,7 +686,7 @@ async def _run_video_generation(
             seconds=seconds,
             preset=preset,
             timeout_s=timeout_s,
-            input_reference=input_reference,
+            input_references=input_references,
             progress_cb=progress_cb,
         )
 
@@ -721,7 +771,7 @@ async def _run_video_job(
     prompt: str,
     seconds: int,
     preset: str | None,
-    input_reference: dict[str, Any] | None = None,
+    input_references: list[dict[str, Any]] | None = None,
 ) -> None:
     try:
         await _set_job_status(job, status="in_progress", progress=1)
@@ -763,7 +813,7 @@ async def _run_video_job(
                 seconds=seconds,
                 preset=resolved_preset,
                 timeout_s=timeout_s,
-                input_reference=input_reference,
+                input_references=input_references,
                 progress_cb=_progress,
             )
             raw, _mime = await _download_video_bytes(token, artifact.video_url)
@@ -792,7 +842,7 @@ async def _run_video_job(
         logger.exception("video job failed: job_id={} error={}", job.id, exc)
         async with _VIDEO_JOBS_LOCK:
             job.status = "failed"
-            job.error = _job_error_payload(str(exc))
+            job.error = _job_error_payload(_exception_message(exc))
 
 
 async def create_video(
@@ -804,6 +854,7 @@ async def create_video(
     resolution_name: str | None = None,
     preset: str | None = None,
     input_reference: dict[str, Any] | None = None,
+    input_references: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     spec = model_registry.get(model)
     if spec is None or not spec.enabled or not spec.is_video():
@@ -819,6 +870,11 @@ async def create_video(
     _aspect_ratio, default_resolution_name = _resolve_video_size(normalized_size)
     _resolve_video_resolution_name(resolution_name, default=default_resolution_name)
     _resolve_video_preset(preset)
+    normalized_input_references = (
+        input_references
+        if input_references is not None
+        else ([input_reference] if input_reference else None)
+    )
 
     job = _VideoJob(
         id=f"video_{uuid.uuid4().hex}",
@@ -838,7 +894,7 @@ async def create_video(
             prompt=cleaned_prompt,
             seconds=normalized_seconds,
             preset=preset,
-            input_reference=input_reference,
+            input_references=normalized_input_references,
         )
     )
     asyncio.create_task(_expire_video_job(job.id))
@@ -869,9 +925,9 @@ async def content_path(video_id: str) -> Path:
     return path
 
 
-def _extract_video_prompt_and_reference(messages: list[dict]) -> tuple[str, dict[str, Any] | None]:
+def _extract_video_prompt_and_reference(messages: list[dict]) -> tuple[str, list[dict[str, Any]] | None]:
     prompt = ""
-    reference_url = ""
+    reference_urls: list[str] = []
 
     for msg in reversed(messages):
         content = msg.get("content", "")
@@ -884,7 +940,7 @@ def _extract_video_prompt_and_reference(messages: list[dict]) -> tuple[str, dict
             continue
 
         text_parts: list[str] = []
-        block_reference = ""
+        block_references: list[str] = []
         for item in content:
             if not isinstance(item, dict):
                 continue
@@ -896,24 +952,26 @@ def _extract_video_prompt_and_reference(messages: list[dict]) -> tuple[str, dict
             elif item_type == "image_url":
                 image_url = item.get("image_url")
                 if isinstance(image_url, dict):
-                    block_reference = str(image_url.get("url") or "").strip() or block_reference
-                elif isinstance(image_url, str):
-                    block_reference = image_url.strip() or block_reference
+                    url = str(image_url.get("url") or "").strip()
+                    if url:
+                        block_references.append(url)
+                elif isinstance(image_url, str) and image_url.strip():
+                    block_references.append(image_url.strip())
 
         if text_parts:
             prompt = " ".join(text_parts)
-        if block_reference and not reference_url:
-            reference_url = block_reference
+        if block_references and not reference_urls:
+            reference_urls = block_references
         if prompt:
             break
 
     if not prompt:
         raise ValidationError("Video prompt cannot be empty", param="messages")
 
-    input_reference: dict[str, Any] | None = None
-    if reference_url:
-        input_reference = {"image_url": reference_url}
-    return prompt, input_reference
+    input_references: list[dict[str, Any]] | None = None
+    if reference_urls:
+        input_references = [{"image_url": url} for url in reference_urls[:7]]
+    return prompt, input_references
 
 
 async def completions(
@@ -934,7 +992,7 @@ async def completions(
         default=default_resolution_name,
     )
     resolved_preset = _resolve_video_preset(preset)
-    prompt, input_reference = _extract_video_prompt_and_reference(messages)
+    prompt, input_references = _extract_video_prompt_and_reference(messages)
 
     cfg = get_config()
     is_stream = stream if stream is not None else cfg.get_bool("features.stream", False)
@@ -950,7 +1008,7 @@ async def completions(
                 seconds=seconds,
                 preset=resolved_preset,
                 timeout_s=timeout_s,
-                input_reference=input_reference,
+                input_references=input_references,
                 progress_cb=progress_cb,
             )
             file_id = hashlib.sha1(artifact.video_url.encode("utf-8")).hexdigest()[:32]

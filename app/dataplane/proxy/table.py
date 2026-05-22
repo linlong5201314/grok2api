@@ -12,6 +12,9 @@ from app.control.proxy.models import (
 )
 
 
+BundleKey = tuple[str, str]
+
+
 @dataclass
 class ProxyRuntimeTable:
     """Read-only snapshot of proxy state for dataplane selection."""
@@ -19,7 +22,7 @@ class ProxyRuntimeTable:
     egress_mode:    EgressMode    = EgressMode.DIRECT
     clearance_mode: ClearanceMode = ClearanceMode.NONE
     nodes:          list[EgressNode]                  = field(default_factory=list)
-    bundles:        dict[str, ClearanceBundle]         = field(default_factory=dict)
+    bundles:        dict[BundleKey, ClearanceBundle]   = field(default_factory=dict)
 
     @property
     def node_count(self) -> int:

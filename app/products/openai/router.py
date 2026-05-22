@@ -530,14 +530,19 @@ async def videos_create(
     resolution: Annotated[str | None, Form()] = None,
     preset: Annotated[Literal["fun", "normal", "spicy", "custom"] | None, Form()] = None,
     input_reference: Annotated[UploadFile | None, File()] = None,
+    input_reference_files: Annotated[list[UploadFile] | None, File(alias="input_reference[]")] = None,
 ):
     from .video import create_video
 
-    reference_payload = None
+    reference_uploads: list[UploadFile] = []
     if input_reference is not None:
-        reference_payload = {
-            "image_url": await _upload_to_data_uri(input_reference, param="input_reference"),
-        }
+        reference_uploads.append(input_reference)
+    if input_reference_files:
+        reference_uploads.extend(input_reference_files)
+    references_payload = [
+        {"image_url": await _upload_to_data_uri(item, param=f"input_reference.{index}")}
+        for index, item in enumerate(reference_uploads[:7])
+    ] or None
 
     result = await create_video(
         model=model or "grok-video",
@@ -550,7 +555,7 @@ async def videos_create(
             param="resolution",
         ),
         preset=preset,
-        input_reference=reference_payload,
+        input_references=references_payload,
     )
     return JSONResponse(result)
 
