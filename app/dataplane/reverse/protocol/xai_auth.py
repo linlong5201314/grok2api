@@ -228,13 +228,13 @@ async def set_birth_date(
 
 
 async def nsfw_sequence(token: str) -> None:
-    """Run set_birth_date → enable_nsfw sharing one session + lease.
+    """Run accept_tos → set_birth_date → enable_nsfw.
 
-    Compared to calling the two functions individually this saves one TCP+TLS
-    handshake per token, which matters in high-concurrency batch scenarios.
+    accept_tos runs against ``accounts.x.ai`` with its own host-specific
+    clearance. The grok.com birth-date and NSFW update steps still share one
+    session + lease to avoid an extra handshake per token.
     """
-    cfg       = get_config()
-    timeout_s = cfg.get_float("nsfw.timeout", 30.0)
+    await accept_tos(token)
 
     proxy = await get_proxy_runtime()
     lease = await proxy.acquire(

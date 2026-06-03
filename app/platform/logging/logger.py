@@ -34,18 +34,6 @@ def _get_env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _default_file_logging_enabled() -> bool:
-    # Serverless filesystems are often read-only outside /tmp.
-    # Keep file logging opt-in there unless LOG_FILE_ENABLED is set explicitly.
-    if (
-        os.getenv("VERCEL")
-        or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
-        or os.getenv("FUNCTIONS_WORKER_RUNTIME")
-    ):
-        return False
-    return True
-
-
 def setup_logging(
     *,
     level: str = "INFO",
@@ -100,7 +88,7 @@ def reload_logging(
 ) -> None:
     """Re-configure logging from runtime values (called after config loads)."""
     resolved_level = (level or "").strip() or os.getenv("LOG_LEVEL", default_level)
-    file_logging = _get_env_bool("LOG_FILE_ENABLED", _default_file_logging_enabled())
+    file_logging = _get_env_bool("LOG_FILE_ENABLED", True)
     setup_logging(
         level=resolved_level,
         file_level=file_level or resolved_level,
@@ -126,7 +114,7 @@ def reload_file_logging(
         logger.remove(_file_sink_id)
         _file_sink_id = None
 
-    _file_logging = _get_env_bool("LOG_FILE_ENABLED", _default_file_logging_enabled())
+    _file_logging = _get_env_bool("LOG_FILE_ENABLED", True)
     if not _file_logging:
         return
 
@@ -146,19 +134,7 @@ def _add_file_sink(
     global _file_sink_id
 
     _dir = log_dir or get_log_dir()
-    try:
-        _dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        # Serverless runtimes may expose a read-only code filesystem.
-        # Do not fail startup when file logging cannot be initialised.
-        logger.warning(
-            "file logging disabled: cannot create log dir '{}' (error={})",
-            _dir,
-            exc,
-        )
-        _file_sink_id = None
-        return
-
+    _dir.mkdir(parents=True, exist_ok=True)
     _file_sink_id = logger.add(
         str(_dir / "app_{time:YYYY-MM-DD}.log"),
         level=file_level,

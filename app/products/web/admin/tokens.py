@@ -23,6 +23,7 @@ from app.control.account.commands import (
     AccountPatch,
     AccountUpsert,
     BulkReplacePoolCommand,
+    ListAccountsQuery,
 )
 from app.control.account.enums import AccountStatus
 
@@ -86,6 +87,11 @@ class ToggleTokenDisabledRequest(BaseModel):
     disabled: bool
 
 
+class ToggleTokensDisabledRequest(BaseModel):
+    tokens: list[str]
+    disabled: bool
+
+
 class TokenImportItem(BaseModel):
     token: str
     tags: list[str] = []
@@ -112,50 +118,13 @@ def _quota_brief(q: dict) -> dict:
     return out
 
 
-def _quota_remaining(q: dict, mode: str) -> int:
-    v = q.get(mode)
-    if not isinstance(v, dict):
-        return -1
-    try:
-        return int(v.get("remaining", -1))
-    except (TypeError, ValueError):
-        return -1
-
-
-def _quota_window_known(q: dict, mode: str) -> bool:
-    v = q.get(mode)
-    if not isinstance(v, dict):
-        return False
-    if _quota_remaining(q, mode) < 0:
-        return False
-    try:
-        return int(v.get("source", 0) or 0) != 0
-    except (TypeError, ValueError):
-        return False
-
-
-def _quota_known(q: dict) -> bool:
-    return any(_quota_window_known(q, mode) for mode in ("auto", "fast", "expert"))
-
-
-def _token_type(pool: str) -> str:
-    return "ssoSuper" if pool in {"super", "heavy"} else "sso"
-
-
 def _serialize_record(r) -> dict:
-    pool = r.pool or "basic"
-    quota = r.quota if isinstance(r.quota, dict) else {}
     return {
         "token":       r.token,
-        "pool":        pool,
-        "token_type":  _token_type(pool),
+        "pool":        r.pool or "basic",
         "status":      r.status,
-        "quota":       _quota_brief(quota),
-        "quota_known": _quota_known(quota),
-        "heavy_quota": _quota_remaining(quota, "heavy"),
-        "heavy_quota_known": _quota_window_known(quota, "heavy"),
+        "quota":       _quota_brief(r.quota) if isinstance(r.quota, dict) else {},
         "use_count":   r.usage_use_count or 0,
-        "fail_count":  r.usage_fail_count or 0,
         "last_used_at": r.last_use_at,
         "tags":        r.tags or [],
     }
@@ -172,14 +141,17 @@ def _json(data) -> Response:
 
 @router.get("/tokens")
 async def list_tokens(repo: "AccountRepository" = Depends(get_repo)):
-    """Return flat token list.
+    """Return flat token list."""
+    all_items: list = []
+    page_num = 1
+    while True:
+        page = await repo.list_accounts(ListAccountsQuery(page=page_num, page_size=2000))
+        all_items.extend(page.items)
+        if page_num * 2000 >= page.total:
+            break
+        page_num += 1
 
-    Uses runtime_snapshot() — a single backend scan — instead of repeatedly
-    paging through list_accounts().  For the Redis backend in particular this
-    avoids re-scanning all record keys on every page.
-    """
-    snapshot = await repo.runtime_snapshot()
-    return _json({"tokens": [_serialize_record(r) for r in snapshot.items]})
+    return _json({"tokens": [_serialize_record(r) for r in all_items]})
 
 
 @router.post("/tokens")
@@ -332,7 +304,6 @@ async def edit_token(
         quota_auto=qs.auto.to_dict(),
         quota_fast=qs.fast.to_dict(),
         quota_expert=qs.expert.to_dict(),
-        quota_heavy=qs.heavy.to_dict() if qs.heavy else None,
         usage_use_delta=record.usage_use_count,
         usage_fail_delta=record.usage_fail_count,
         usage_sync_delta=record.usage_sync_count,
@@ -390,6 +361,69 @@ async def toggle_token_disabled(
     )])
     logger.info("admin token restored: token={}", _mask(token))
     return _json({"status": "success", "token": token, "disabled": False})
+
+
+@router.post("/tokens/disabled/batch")
+async def toggle_tokens_disabled(
+    req: ToggleTokensDisabledRequest,
+    repo: "AccountRepository" = Depends(get_repo),
+):
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in req.tokens:
+        token = _sanitize(raw)
+        if token and token not in seen:
+            seen.add(token)
+            cleaned.append(token)
+    if not cleaned:
+        raise ValidationError("No valid tokens provided", param="tokens")
+
+    records = await repo.get_accounts(cleaned)
+    if not records:
+        raise AppError(
+            "No matching accounts found",
+            kind=ErrorKind.VALIDATION,
+            code="account_not_found",
+            status=404,
+        )
+
+    ts = now_ms()
+    patches: list[AccountPatch] = []
+    for record in records:
+        if req.disabled:
+            patches.append(AccountPatch(
+                token=record.token,
+                status=AccountStatus.DISABLED,
+                state_reason="operator_disabled",
+                ext_merge={
+                    **record.ext,
+                    "disabled_at": ts,
+                    "disabled_reason": "operator_disabled",
+                },
+            ))
+        else:
+            patches.append(AccountPatch(
+                token=record.token,
+                status=AccountStatus.ACTIVE,
+                clear_failures=True,
+            ))
+
+    result = await repo.patch_accounts(patches)
+    logger.info(
+        "admin tokens disabled batch updated: disabled={} requested_count={} patched_count={}",
+        req.disabled,
+        len(cleaned),
+        result.patched,
+    )
+    return _json({
+        "status": "success",
+        "disabled": req.disabled,
+        "summary": {
+            "total": len(cleaned),
+            "ok": result.patched,
+            "fail": max(0, len(cleaned) - result.patched),
+        },
+    })
 
 
 @router.put("/tokens/pool")

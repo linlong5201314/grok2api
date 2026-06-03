@@ -24,21 +24,16 @@ from app.control.model.registry import resolve as resolve_model
 from app.control.account.enums import FeedbackKind
 from app.dataplane.reverse.protocol.xai_chat import classify_line, StreamAdapter
 from app.dataplane.reverse.protocol.tool_prompt import (
-    build_tool_system_prompt, inject_into_message,
+    build_tool_system_prompt, extract_tool_names, inject_into_message,
 )
 from app.dataplane.reverse.protocol.tool_parser import parse_tool_calls
-from app.dataplane.reverse.protocol.tool_request import (
-    allowed_tool_names,
-    normalize_parsed_tool_calls,
-    validate_strict_tools,
-    validate_tool_choice_tools,
-)
 
 from app.products.openai.chat import (
-    _sampling_model_config, _stream_chat, _extract_message, _resolve_image,
-    _quota_sync, _fail_sync, _feedback_kind, _log_task_exception,
-    _configured_retry_codes, _reserve_chat_account, _should_retry_upstream,
+    _stream_chat, _extract_message, _resolve_image,
+    _quota_sync, _fail_sync, _parse_retry_codes, _feedback_kind, _log_task_exception,
+    _configured_retry_codes, _should_retry_upstream,
 )
+from app.products._account_selection import reserve_account, selection_max_retries
 from app.products.openai._tool_sieve import ToolSieve
 
 
@@ -101,13 +96,6 @@ def _anthropic_content_to_internal(content: Any, role: str) -> list[dict]:
                     b.get("text", "") for b in result_content
                     if isinstance(b, dict) and b.get("type") == "text"
                 )
-            elif isinstance(result_content, dict):
-                try:
-                    result_content = orjson.dumps(result_content).decode()
-                except Exception:
-                    result_content = str(result_content)
-            elif not isinstance(result_content, str):
-                result_content = "" if result_content is None else str(result_content)
             messages.append({
                 "role":         "tool",
                 "tool_call_id": block.get("tool_use_id", ""),
@@ -153,8 +141,6 @@ def _anthropic_content_to_internal(content: Any, role: str) -> list[dict]:
                 normalized.append({"type": "text", "text": text})
         elif btype == "image":
             source = block.get("source") or {}
-            if not isinstance(source, dict):
-                continue
             src_type = source.get("type", "")
             if src_type == "base64":
                 media = source.get("media_type", "image/jpeg")
@@ -170,8 +156,6 @@ def _anthropic_content_to_internal(content: Any, role: str) -> list[dict]:
                 })
         elif btype == "document":
             source = block.get("source") or {}
-            if not isinstance(source, dict):
-                continue
             src_type = source.get("type", "")
             if src_type == "base64":
                 media = source.get("media_type", "application/pdf")
@@ -223,18 +207,12 @@ def _convert_tools(tools: list[dict]) -> list[dict]:
     """
     result = []
     for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        name = tool.get("name")
-        if not isinstance(name, str) or not name.strip():
-            continue
         result.append({
             "type": "function",
             "function": {
-                "name":        name,
+                "name":        tool.get("name", ""),
                 "description": tool.get("description", ""),
                 "parameters":  tool.get("input_schema"),
-                "strict":      tool.get("strict"),
             },
         })
     return result
@@ -247,11 +225,7 @@ def _convert_tool_choice(tool_choice: Any) -> Any:
     if isinstance(tool_choice, str):
         return tool_choice
     if isinstance(tool_choice, dict):
-        if tool_choice.get("name") and not tool_choice.get("type"):
-            return {"type": "function", "function": {"name": tool_choice.get("name", "")}}
         tc_type = tool_choice.get("type", "auto")
-        if tc_type == "none":
-            return "none"
         if tc_type == "auto":
             return "auto"
         if tc_type == "any":
@@ -312,6 +286,7 @@ async def create(
 
     cfg     = get_config()
     spec    = resolve_model(model)
+    mode_id = int(spec.mode_id)
 
     # Build internal message list
     internal_messages = _parse_anthropic_messages(messages, system)
@@ -322,16 +297,12 @@ async def create(
     # Tool injection
     tool_names: list[str] = []
     internal_tool_choice: Any = None
-    chat_tools: list[dict] | None = None
-    internal_tool_choice = _convert_tool_choice(tool_choice)
-    validate_tool_choice_tools(tools, internal_tool_choice)
     if tools:
         chat_tools       = _convert_tools(tools)
-        validate_strict_tools(chat_tools)
-        tool_names = allowed_tool_names(chat_tools, internal_tool_choice)
-        if tool_names:
-            tool_prompt      = build_tool_system_prompt(chat_tools, internal_tool_choice)
-            internal_message = inject_into_message(internal_message, tool_prompt)
+        tool_names       = extract_tool_names(chat_tools)
+        internal_tool_choice = _convert_tool_choice(tool_choice)
+        tool_prompt      = build_tool_system_prompt(chat_tools, internal_tool_choice)
+        internal_message = inject_into_message(internal_message, tool_prompt)
         logger.info("messages tool injection: tool_names={} choice={}", tool_names, internal_tool_choice)
 
     from app.dataplane.account import _directory as _acct_dir
@@ -339,11 +310,10 @@ async def create(
         raise RateLimitError("Account directory not initialised")
     directory = _acct_dir
 
-    max_retries = cfg.get_int("retry.max_retries", 1)
+    max_retries = selection_max_retries()
     retry_codes = _configured_retry_codes(cfg)
     timeout_s   = cfg.get_float("chat.timeout", 120.0)
     msg_id      = _make_msg_id()
-    model_config_override = _sampling_model_config(temperature, top_p)
 
     # -------------------------------------------------------------------------
     # Streaming
@@ -351,12 +321,11 @@ async def create(
     async def _run_stream() -> AsyncGenerator[str, None]:
         excluded: list[str] = []
         for attempt in range(max_retries + 1):
-            acct, selected_mode_id = await _reserve_chat_account(
+            acct, selected_mode_id = await reserve_account(
                 directory,
                 spec,
-                cfg,
-                now_s_override = now_s(),
-                exclude_tokens = excluded or None,
+                now_s_override=now_s(),
+                exclude_tokens=excluded or None,
             )
             if acct is None:
                 raise RateLimitError("No available accounts for this model tier")
@@ -375,6 +344,7 @@ async def create(
             tool_calls_emitted    = False
             tool_output_tokens    = 0
             block_index           = 0  # tracks next content_block index
+            collected_annotations: list[dict] = []
 
             try:
                 try:
@@ -399,7 +369,6 @@ async def create(
                         mode_id   = ModeId(selected_mode_id),
                         message   = internal_message,
                         files     = files,
-                        model_config_override = model_config_override,
                         timeout_s = timeout_s,
                     ):
                         if tool_calls_emitted:
@@ -442,7 +411,6 @@ async def create(
                                 if sieve is not None:
                                     safe_text, calls = sieve.feed(ev.content)
                                     if calls is not None:
-                                        calls = normalize_parsed_tool_calls(calls, chat_tools)
                                         # Emit tool_use blocks
                                         for call in calls:
                                             yield _sse("content_block_start", {
@@ -491,6 +459,9 @@ async def create(
                                         "delta": {"type": "text_delta", "text": text_chunk},
                                     })
 
+                            elif ev.kind == "annotation" and ev.annotation_data:
+                                collected_annotations.append(ev.annotation_data)
+
                             elif ev.kind == "soft_stop":
                                 ended = True
                                 break
@@ -500,23 +471,8 @@ async def create(
 
                     # Flush sieve — incomplete XML at end of stream
                     if sieve is not None and not tool_calls_emitted:
-                        flushed_text, calls = sieve.flush()
-                        if flushed_text:
-                            if not text_started:
-                                text_started = True
-                                yield _sse("content_block_start", {
-                                    "type":          "content_block_start",
-                                    "index":         block_index,
-                                    "content_block": {"type": "text", "text": ""},
-                                })
-                            text_buf.append(flushed_text)
-                            yield _sse("content_block_delta", {
-                                "type":  "content_block_delta",
-                                "index": block_index,
-                                "delta": {"type": "text_delta", "text": flushed_text},
-                            })
+                        calls = sieve.flush()
                         if calls:
-                            calls = normalize_parsed_tool_calls(calls, chat_tools)
                             # Close text block if open
                             if text_started:
                                 yield _sse("content_block_stop", {
@@ -553,9 +509,14 @@ async def create(
                             tool_calls_emitted = True
 
                     if tool_calls_emitted:
+                        # 构建 tool_use 的 message_delta，注入搜索信源
+                        tool_delta: dict = {"stop_reason": "tool_use", "stop_sequence": None}
+                        sources = adapter.search_sources_list()
+                        if sources:
+                            tool_delta["search_sources"] = sources
                         yield _sse("message_delta", {
                             "type":  "message_delta",
-                            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                            "delta": tool_delta,
                             "usage": {"output_tokens": tool_output_tokens},
                         })
                         yield _sse("message_stop", {"type": "message_stop"})
@@ -570,34 +531,22 @@ async def create(
                             if isinstance(img_text, str):
                                 chunk = img_text + "\n"
                                 text_buf.append(chunk)
-                                if not text_started:
-                                    text_started = True
-                                    yield _sse("content_block_start", {
-                                        "type":          "content_block_start",
-                                        "index":         block_index,
-                                        "content_block": {"type": "text", "text": ""},
+                                if text_started:
+                                    yield _sse("content_block_delta", {
+                                        "type":  "content_block_delta",
+                                        "index": block_index,
+                                        "delta": {"type": "text_delta", "text": chunk},
                                     })
-                                yield _sse("content_block_delta", {
-                                    "type":  "content_block_delta",
-                                    "index": block_index,
-                                    "delta": {"type": "text_delta", "text": chunk},
-                                })
 
                         references = adapter.references_suffix()
                         if references:
                             text_buf.append(references)
-                            if not text_started:
-                                text_started = True
-                                yield _sse("content_block_start", {
-                                    "type":          "content_block_start",
-                                    "index":         block_index,
-                                    "content_block": {"type": "text", "text": ""},
+                            if text_started:
+                                yield _sse("content_block_delta", {
+                                    "type":  "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {"type": "text_delta", "text": references},
                                 })
-                            yield _sse("content_block_delta", {
-                                "type":  "content_block_delta",
-                                "index": block_index,
-                                "delta": {"type": "text_delta", "text": references},
-                            })
 
                         # Close open blocks
                         if think_started and not think_closed:
@@ -619,9 +568,16 @@ async def create(
                         if full_think:
                             out_tokens += estimate_tokens(full_think)
 
+                        # 构建 message_delta，注入结构化搜索信源和 annotations
+                        msg_delta: dict = {"stop_reason": "end_turn", "stop_sequence": None}
+                        sources = adapter.search_sources_list()
+                        if sources:
+                            msg_delta["search_sources"] = sources
+                        if collected_annotations:
+                            msg_delta["annotations"] = collected_annotations
                         yield _sse("message_delta", {
                             "type":  "message_delta",
-                            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                            "delta": msg_delta,
                             "usage": {"output_tokens": out_tokens},
                         })
                         yield _sse("message_stop", {"type": "message_stop"})
@@ -672,12 +628,11 @@ async def create(
     adapter  = StreamAdapter()
 
     for attempt in range(max_retries + 1):
-        acct, selected_mode_id = await _reserve_chat_account(
+        acct, selected_mode_id = await reserve_account(
             directory,
             spec,
-            cfg,
-            now_s_override = now_s(),
-            exclude_tokens = excluded or None,
+            now_s_override=now_s(),
+            exclude_tokens=excluded or None,
         )
         if acct is None:
             raise RateLimitError("No available accounts for this model tier")
@@ -696,7 +651,6 @@ async def create(
                     mode_id   = ModeId(selected_mode_id),
                     message   = internal_message,
                     files     = files,
-                    model_config_override = model_config_override,
                     timeout_s = timeout_s,
                 ):
                     event_type, data = classify_line(line)
@@ -769,9 +723,8 @@ async def create(
     if tool_names:
         tc_result = parse_tool_calls(full_text, tool_names)
         if tc_result.calls:
-            tool_calls = normalize_parsed_tool_calls(tc_result.calls, chat_tools)
             content: list[dict] = []
-            for call in tool_calls:
+            for call in tc_result.calls:
                 try:
                     parsed_input = orjson.loads(call.arguments)
                 except (orjson.JSONDecodeError, ValueError):
@@ -782,9 +735,14 @@ async def create(
                     "name":  call.name,
                     "input": parsed_input,
                 })
-            ct = estimate_tool_call_tokens(tool_calls)
-            logger.info("messages tool_calls: model={} calls={}", model, len(tool_calls))
-            return _build_message_response(msg_id, model, content, "tool_use", in_tokens, ct)
+            ct = estimate_tool_call_tokens(tc_result.calls)
+            logger.info("messages tool_calls: model={} calls={}", model, len(tc_result.calls))
+            resp = _build_message_response(msg_id, model, content, "tool_use", in_tokens, ct)
+            # 注入结构化搜索信源（tool_use 场景）
+            sources = adapter.search_sources_list()
+            if sources:
+                resp["search_sources"] = sources
+            return resp
 
     logger.info(
         "messages request completed: model={} text_len={} think_len={} images={}",
@@ -792,7 +750,14 @@ async def create(
     )
 
     content = [{"type": "text", "text": full_text}]
-    return _build_message_response(msg_id, model, content, "end_turn", in_tokens, out_tokens)
+    anns = adapter.annotations_list()
+    if anns:
+        content[0]["annotations"] = anns
+    resp = _build_message_response(msg_id, model, content, "end_turn", in_tokens, out_tokens)
+    sources = adapter.search_sources_list()
+    if sources:
+        resp["search_sources"] = sources
+    return resp
 
 
 __all__ = ["create"]

@@ -17,6 +17,7 @@ from app.platform.auth.middleware import verify_admin_key
 from app.platform.config.snapshot import config
 from app.platform.errors import AppError, ErrorKind, ValidationError
 from app.platform.logging.logger import logger, reload_file_logging
+from app.platform.storage import reconcile_local_media_cache_async
 
 if TYPE_CHECKING:
     from app.control.account.refresh import AccountRefreshService
@@ -135,6 +136,13 @@ def _ensure_runtime_patch_allowed(payload: dict[str, Any]) -> None:
                 )
 
 
+def _patch_touches_prefix(payload: dict[str, Any], prefix: str) -> bool:
+    return any(
+        path == prefix or path.startswith(f"{prefix}.")
+        for path in _iter_patch_paths(payload)
+    )
+
+
 def get_repo(request: Request) -> "AccountRepository":
     """Resolve the singleton AccountRepository from app state."""
     return request.app.state.repository
@@ -184,8 +192,11 @@ async def get_config_endpoint():
 
 @router.post("/config", tags=[_TAG_ADMIN_SYSTEM])
 async def update_config(req: ConfigPatchRequest):
+    from app.control.account.runtime import reconcile_refresh_runtime
+
     patch = _sanitize_proxy_config(req.root)
     _ensure_runtime_patch_allowed(patch)
+    cache_local_changed = _patch_touches_prefix(patch, "cache.local")
     await config.update(patch)
     # config.update() only writes to the backend and invalidates the in-memory
     # snapshot (_version = None); it does not refresh the data.  load() is
@@ -195,7 +206,14 @@ async def update_config(req: ConfigPatchRequest):
         file_level=config.get_str("logging.file_level", "") or None,
         max_files=config.get_int("logging.max_files", 7),
     )
-    return {"status": "success", "message": "配置已更新"}
+    if cache_local_changed:
+        await reconcile_local_media_cache_async()
+    strategy_name = reconcile_refresh_runtime()
+    return {
+        "status": "success",
+        "message": "配置已更新",
+        "selection_strategy": strategy_name,
+    }
 
 
 @router.get("/storage", tags=[_TAG_ADMIN_SYSTEM])
@@ -205,6 +223,7 @@ async def get_storage_mode():
 
 @router.get("/status", tags=[_TAG_ADMIN_SYSTEM])
 async def runtime_status():
+    from app.control.account.runtime import reconcile_refresh_runtime
     from app.dataplane.account import _directory
 
     if _directory is None:
@@ -214,12 +233,14 @@ async def runtime_status():
             code="directory_not_initialised",
             status=503,
         )
+    strategy_name = reconcile_refresh_runtime()
     return Response(
         content=orjson.dumps(
             {
                 "status": "ok",
                 "size": _directory.size,
                 "revision": _directory.revision,
+                "selection_strategy": strategy_name,
             }
         ),
         media_type="application/json",
@@ -244,88 +265,4 @@ async def force_sync():
     )
 
 
-@router.get("/overview", tags=[_TAG_ADMIN_SYSTEM])
-async def overview():
-    """Aggregate counters built from the in-memory account directory.
-
-    Zero DB hits — reads the columnar runtime table directly so the admin
-    dashboard "概览" panel can render before the full account list arrives.
-    """
-    from app.dataplane.account import _directory
-    from app.dataplane.shared.enums import PoolId, StatusId
-
-    if _directory is None or _directory._table is None:
-        raise AppError(
-            "Account directory not initialised",
-            kind=ErrorKind.SERVER,
-            code="directory_not_initialised",
-            status=503,
-        )
-
-    table = _directory._table
-    pool_id_to_name = {
-        int(PoolId.BASIC): "basic",
-        int(PoolId.SUPER): "super",
-        int(PoolId.HEAVY): "heavy",
-    }
-    status_id_to_name = {
-        int(StatusId.ACTIVE):   "active",
-        int(StatusId.COOLING):  "cooling",
-        int(StatusId.EXPIRED):  "expired",
-        int(StatusId.DISABLED): "disabled",
-    }
-    deleted_id = int(StatusId.DELETED)
-
-    pool_counts:   dict[str, int] = {name: 0 for name in pool_id_to_name.values()}
-    status_counts: dict[str, int] = {name: 0 for name in status_id_to_name.values()}
-    total = 0
-    nsfw_idxs = table.tag_idx.get("nsfw", set())
-    nsfw_on   = 0
-
-    status_col = table.status_by_idx
-    pool_col   = table.pool_by_idx
-    for idx in range(len(table.token_by_idx)):
-        sid = int(status_col[idx])
-        if sid == deleted_id:
-            continue
-        total += 1
-        status_name = status_id_to_name.get(sid, "expired")
-        status_counts[status_name] = status_counts.get(status_name, 0) + 1
-        pool_name = pool_id_to_name.get(int(pool_col[idx]))
-        if pool_name:
-            pool_counts[pool_name] = pool_counts.get(pool_name, 0) + 1
-
-    nsfw_on = sum(
-        1
-        for idx in nsfw_idxs
-        if int(status_col[idx]) != deleted_id
-    )
-
-    payload = {
-        "revision":       _directory.revision,
-        "total":          total,
-        "pool_counts":    pool_counts,
-        "status_counts":  status_counts,
-        "nsfw_counts": {
-            "enabled":  nsfw_on,
-            "disabled": max(0, total - nsfw_on),
-        },
-    }
-    return Response(content=orjson.dumps(payload), media_type="application/json")
-
-
-compat_router = APIRouter(prefix="/api/v1/admin", dependencies=[Depends(verify_admin_key)])
-compat_router.include_router(_tokens_router)
-compat_router.include_router(_batch_router)
-compat_router.include_router(_assets_router)
-compat_router.include_router(_cache_router)
-compat_router.add_api_route("/verify", admin_verify, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
-compat_router.add_api_route("/config", get_config_endpoint, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
-compat_router.add_api_route("/config", update_config, methods=["POST"], tags=[_TAG_ADMIN_SYSTEM])
-compat_router.add_api_route("/storage", get_storage_mode, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
-compat_router.add_api_route("/status", runtime_status, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
-compat_router.add_api_route("/sync", force_sync, methods=["POST"], tags=[_TAG_ADMIN_SYSTEM])
-compat_router.add_api_route("/overview", overview, methods=["GET"], tags=[_TAG_ADMIN_SYSTEM])
-
-
-__all__ = ["router", "compat_router", "get_repo", "get_refresh_svc"]
+__all__ = ["router", "get_repo", "get_refresh_svc"]

@@ -3,7 +3,6 @@
 import base64
 import binascii
 import mimetypes
-import time
 from typing import Annotated, AsyncGenerator, AsyncIterable, Literal
 
 import orjson
@@ -11,14 +10,13 @@ from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 
 from app.control.account.state_machine import is_manageable
-from app.dataplane.shared.enums import StatusId
 from app.platform.auth.middleware import verify_api_key
 from app.platform.errors import AppError, ValidationError
 from app.platform.logging.logger import logger
 from app.platform.storage import image_files_dir, video_files_dir
-from app.dataplane.reverse.protocol.tool_request import normalize_openai_tool_choice, normalize_openai_tools
 from app.control.model import registry as model_registry
 from app.control.model.spec import ModelSpec
+from app.control.account.quota_defaults import supports_mode
 from .schemas import (
     ChatCompletionRequest,
     ImageGenerationRequest,
@@ -37,101 +35,44 @@ _TAG_IMAGES = "OpenAI - Images"
 _TAG_VIDEOS = "OpenAI - Videos"
 _TAG_FILES = "OpenAI - Files"
 
-# Status ids that count as "manageable" (active or cooling) — mirrors
-# state_machine.is_manageable() but works directly on the int column of the
-# in-memory runtime table to avoid building AccountRecord objects.
-_MANAGEABLE_STATUS_IDS = frozenset({int(StatusId.ACTIVE), int(StatusId.COOLING)})
-
-# Cache for /v1/models pool-availability lookup.
-#
-# Why: ``_available_pools`` is hit on every ``/v1/models`` and per-model
-# ``/v1/models/{id}`` call.  SDK clients often hammer ``/v1/models`` at
-# startup.  Previously each call did a full ``runtime_snapshot()`` which
-# pulls every non-deleted row from the repository.  We now derive the set
-# from the in-memory ``AccountDirectory`` and memoise per directory
-# revision with a short TTL fallback.
-_POOLS_CACHE: dict[str, frozenset[str]] = {}
-_POOLS_CACHE_META: dict[str, tuple[int, float]] = {}  # key -> (revision, expires_at)
-_POOLS_CACHE_TTL_SECONDS = 30.0
-
-
-def _compute_available_pools(directory) -> frozenset[str]:
-    """Scan the directory's columnar table for manageable pool names."""
-    table = directory._table
-    if table is None:
-        return frozenset()
-    pools: set[str] = set()
-    status_col = table.status_by_idx
-    pool_col   = table.pool_by_idx
-    for idx in range(len(table.token_by_idx)):
-        if int(status_col[idx]) not in _MANAGEABLE_STATUS_IDS:
-            continue
-        name = _POOL_ID_TO_NAME.get(int(pool_col[idx]))
-        if name:
-            pools.add(name)
-        # Early-exit when all three known pools have been observed.
-        if len(pools) == len(_POOL_ID_TO_NAME):
-            break
-    return frozenset(pools)
-
 
 async def _available_pools(request: Request) -> frozenset[str]:
-    """Return the set of pool names with at least one manageable account.
-
-    Fast path: derive from the in-memory ``AccountDirectory`` (no DB hit) and
-    cache by ``(table.revision)`` with a 30 s TTL.
-    Slow path (directory not yet bootstrapped): fall back to a full DB
-    snapshot — same behaviour as before.
-    """
-    directory = getattr(request.app.state, "directory", None)
-    if directory is not None and directory._table is not None:
-        rev = directory.revision
-        meta = _POOLS_CACHE_META.get("default")
-        now  = time.monotonic()
-        if meta and meta[0] == rev and now < meta[1]:
-            return _POOLS_CACHE["default"]
-        pools = _compute_available_pools(directory)
-        _POOLS_CACHE["default"] = pools
-        _POOLS_CACHE_META["default"] = (rev, now + _POOLS_CACHE_TTL_SECONDS)
-        return pools
-
-    # Fallback for cold-start before the directory is ready.
     repo = getattr(request.app.state, "repository", None)
     if repo is None:
         return frozenset()
+
     snapshot = await repo.runtime_snapshot()
-    return frozenset(
-        record.pool
-        for record in snapshot.items
-        if is_manageable(record)
-    )
+    pools = {record.pool for record in snapshot.items if is_manageable(record)}
+    return frozenset(pools)
 
 
 def _model_available_for_pools(spec: ModelSpec, pools: frozenset[str]) -> bool:
     if not spec.enabled:
         return False
-    candidates = {
-        _POOL_ID_TO_NAME[pool_id]
-        for pool_id in spec.pool_candidates()
-    }
-    return bool(candidates & pools)
+    for pool_id in spec.pool_candidates():
+        pool = _POOL_ID_TO_NAME[pool_id]
+        if pool in pools and supports_mode(pool, int(spec.mode_id)):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
 # /v1/models
 # ---------------------------------------------------------------------------
 
+
 @router.get("/models", tags=[_TAG_MODELS], dependencies=[Depends(verify_api_key)])
 async def list_models(request: Request):
     import time
+
     pools = await _available_pools(request)
     models = [
         {
-            "id":       m.model_name,
-            "object":   "model",
-            "created":  int(time.time()),
+            "id": m.model_name,
+            "object": "model",
+            "created": int(time.time()),
             "owned_by": "xai",
-            "name":     m.public_name,
+            "name": m.public_name,
         }
         for m in model_registry.list_enabled()
         if _model_available_for_pools(m, pools)
@@ -139,28 +80,39 @@ async def list_models(request: Request):
     return JSONResponse({"object": "list", "data": models})
 
 
-@router.get("/models/{model_id}", tags=[_TAG_MODELS], dependencies=[Depends(verify_api_key)])
+@router.get(
+    "/models/{model_id}", tags=[_TAG_MODELS], dependencies=[Depends(verify_api_key)]
+)
 async def get_model_endpoint(model_id: str, request: Request):
     import time
+
     spec = model_registry.get(model_id)
     pools = await _available_pools(request)
     if spec is None or not _model_available_for_pools(spec, pools):
         return JSONResponse(
-            {"error": {"message": f"Model {model_id!r} not found", "type": "invalid_request_error"}},
+            {
+                "error": {
+                    "message": f"Model {model_id!r} not found",
+                    "type": "invalid_request_error",
+                }
+            },
             status_code=404,
         )
-    return JSONResponse({
-        "id":       spec.model_name,
-        "object":   "model",
-        "created":  int(time.time()),
-        "owned_by": "xai",
-        "name":     spec.public_name,
-    })
+    return JSONResponse(
+        {
+            "id": spec.model_name,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "xai",
+            "name": spec.public_name,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # SSE streaming helpers
 # ---------------------------------------------------------------------------
+
 
 async def _safe_sse(stream: AsyncIterable[str]) -> AsyncGenerator[str, None]:
     """Wrap an SSE stream, converting exceptions to in-band error events."""
@@ -172,7 +124,9 @@ async def _safe_sse(stream: AsyncIterable[str]) -> AsyncGenerator[str, None]:
         yield f"event: error\ndata: {payload}\n\n"
         yield "data: [DONE]\n\n"
     except Exception as exc:
-        payload = orjson.dumps({"error": {"message": str(exc), "type": "server_error"}}).decode()
+        payload = orjson.dumps(
+            {"error": {"message": str(exc), "type": "server_error"}}
+        ).decode()
         yield f"event: error\ndata: {payload}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -184,34 +138,22 @@ _SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
 # /v1/chat/completions
 # ---------------------------------------------------------------------------
 
-_VALID_ROLES      = {"developer", "system", "user", "assistant", "tool"}
+_VALID_ROLES = {"developer", "system", "user", "assistant", "tool"}
 _USER_BLOCK_TYPES = {"text", "image_url", "input_audio", "file"}
-_ALLOWED_SIZES    = {"1280x720", "720x1280", "1792x1024", "1024x1792", "1024x1024"}
-_EFFORT_VALUES    = {"none", "minimal", "low", "medium", "high", "xhigh"}
-_LITE_IMAGE_MODELS = {"grok-imagine-image-lite", "grok-imagine-1.0-fast"}
-_IMAGE_GENERATION_METHOD = "imagine_ws_experimental"
-_VIDEO_RATIO_TO_SIZE = {
-    "16:9": "1280x720",
-    "9:16": "720x1280",
-    "1:1": "1024x1024",
-    "2:3": "1024x1792",
-    "3:2": "1792x1024",
-}
-_VIDEO_RESOLUTION_ALIASES = {
-    "sd": "480p",
-    "hd": "720p",
-    "480p": "480p",
-    "720p": "720p",
-}
+_ALLOWED_SIZES = {"1280x720", "720x1280", "1792x1024", "1024x1792", "1024x1024"}
+_EFFORT_VALUES = {"none", "minimal", "low", "medium", "high", "xhigh"}
+_LITE_IMAGE_MODELS = {"grok-imagine-image-lite"}
 
 
 def _validate_chat(req: ChatCompletionRequest) -> None:
     from app.platform.errors import ValidationError
+
     spec = model_registry.get(req.model)
     if spec is None or not spec.enabled:
         raise ValidationError(
             f"Model {req.model!r} does not exist or you do not have access to it.",
-            param="model", code="model_not_found",
+            param="model",
+            code="model_not_found",
         )
     if not req.messages:
         raise ValidationError("messages cannot be empty", param="messages")
@@ -222,7 +164,9 @@ def _validate_chat(req: ChatCompletionRequest) -> None:
                 param=f"messages.{i}.role",
             )
     if req.temperature is not None and not (0 <= req.temperature <= 2):
-        raise ValidationError("temperature must be between 0 and 2", param="temperature")
+        raise ValidationError(
+            "temperature must be between 0 and 2", param="temperature"
+        )
     if req.top_p is not None and not (0 <= req.top_p <= 1):
         raise ValidationError("top_p must be between 0 and 1", param="top_p")
     if req.reasoning_effort is not None and req.reasoning_effort not in _EFFORT_VALUES:
@@ -246,38 +190,6 @@ def _validate_image_edit_n(n: int, *, param: str) -> None:
         raise ValidationError("n must be between 1 and 2 for image edit", param=param)
 
 
-def _resolve_video_size_alias(size: str | None, aspect_ratio: str | None, *, param: str) -> str:
-    ratio = (aspect_ratio or "").strip()
-    if ratio:
-        resolved = _VIDEO_RATIO_TO_SIZE.get(ratio)
-        if resolved is None:
-            raise ValidationError(
-                f"aspect_ratio must be one of {sorted(_VIDEO_RATIO_TO_SIZE)}",
-                param=param,
-            )
-        return resolved
-    normalized = (size or "720x1280").strip()
-    return _VIDEO_RATIO_TO_SIZE.get(normalized, normalized)
-
-
-def _resolve_video_resolution_alias(
-    resolution_name: str | None,
-    resolution: str | None,
-    *,
-    param: str,
-) -> str | None:
-    raw = (resolution or "").strip()
-    if not raw:
-        return resolution_name
-    resolved = _VIDEO_RESOLUTION_ALIASES.get(raw.lower())
-    if resolved is None:
-        raise ValidationError(
-            f"resolution must be one of {sorted(_VIDEO_RESOLUTION_ALIASES)}",
-            param=param,
-        )
-    return resolved
-
-
 async def _upload_to_data_uri(upload: UploadFile, *, param: str) -> str:
     raw = await upload.read()
     if not raw:
@@ -298,97 +210,105 @@ async def _upload_to_data_uri(upload: UploadFile, *, param: str) -> str:
     return f"data:{mime};base64,{blob_b64}"
 
 
-@router.post("/chat/completions", tags=[_TAG_CHAT], dependencies=[Depends(verify_api_key)])
+@router.post(
+    "/chat/completions", tags=[_TAG_CHAT], dependencies=[Depends(verify_api_key)]
+)
 async def chat_completions_endpoint(req: ChatCompletionRequest):
     _validate_chat(req)
+    from app.platform.config.snapshot import get_config
 
-    spec     = model_registry.get(req.model)
+    cfg = get_config()
+    is_stream = (
+        req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
+    )
+
+    spec = model_registry.get(req.model)
     if spec is None:
         raise ValidationError(
             f"Model {req.model!r} does not exist or you do not have access to it.",
-            param="model", code="model_not_found",
+            param="model",
+            code="model_not_found",
         )
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
-    is_stream = bool(req.stream)
 
     try:
         # Dispatch by model capability.
         if spec.is_image_edit():
             from .images import edit as img_edit
+
             cfg = req.image_config or ImageConfig()
-            n = cfg.n if cfg.n is not None else 1
-            _validate_image_edit_n(n, param="image_config.n")
+            _validate_image_edit_n(cfg.n or 1, param="image_config.n")
             result = await img_edit(
-                model           = req.model,
-                messages        = messages,
-                n               = n,
-                size            = cfg.size or "1024x1024",
-                response_format = cfg.response_format or "url",
-                stream          = is_stream,
-                chat_format     = True,
+                model=req.model,
+                messages=messages,
+                n=cfg.n or 1,
+                size=cfg.size or "1024x1024",
+                response_format=cfg.response_format or "url",
+                stream=is_stream,
+                chat_format=True,
             )
 
         elif spec.is_image():
             from .images import generate as img_gen
-            cfg   = req.image_config or ImageConfig()
-            size  = cfg.size or "1024x1024"
-            fmt   = cfg.response_format or "url"
-            n     = cfg.n if cfg.n is not None else 1
+
+            cfg = req.image_config or ImageConfig()
+            size = cfg.size or "1024x1024"
+            fmt = cfg.response_format or "url"
+            n = cfg.n or 1
             _validate_image_n(req.model, n, param="image_config.n")
             # Extract prompt from last user message.
             prompt = next(
-                (m.content for m in reversed(req.messages)
-                 if m.role == "user" and isinstance(m.content, str) and m.content.strip()),
+                (
+                    m.content
+                    for m in reversed(req.messages)
+                    if m.role == "user"
+                    and isinstance(m.content, str)
+                    and m.content.strip()
+                ),
                 "",
             )
             result = await img_gen(
-                model           = req.model,
-                prompt          = prompt or "",
-                n               = n,
-                size            = size,
-                response_format = fmt,
-                stream          = is_stream,
-                chat_format     = True,
+                model=req.model,
+                prompt=prompt or "",
+                n=n,
+                size=size,
+                response_format=fmt,
+                stream=is_stream,
+                chat_format=True,
             )
 
         elif spec.is_video():
             from .video import completions as vid_comp
+
             vcfg = req.video_config or VideoConfig()
-            seconds = vcfg.video_length
-            if seconds is None:
-                seconds = vcfg.seconds
-            if seconds is None:
-                seconds = 6
             from .video import validate_video_length as _validate_video_length
-            _validate_video_length(seconds)
+
+            _validate_video_length(vcfg.seconds or 6)
             result = await vid_comp(
-                model           = req.model,
-                messages        = messages,
-                stream          = is_stream,
-                seconds         = seconds,
-                size            = _resolve_video_size_alias(
-                    vcfg.size,
-                    vcfg.aspect_ratio,
-                    param="video_config.aspect_ratio",
-                ),
-                resolution_name = _resolve_video_resolution_alias(
-                    vcfg.resolution_name,
-                    vcfg.resolution,
-                    param="video_config.resolution",
-                ),
-                preset          = vcfg.preset,
+                model=req.model,
+                messages=messages,
+                stream=is_stream,
+                seconds=vcfg.seconds or 6,
+                size=vcfg.size or "720x1280",
+                resolution_name=vcfg.resolution_name,
+                preset=vcfg.preset,
             )
 
         else:
+            # reasoning_effort=None → config default; "none" → off; otherwise → on.
+            if req.reasoning_effort is None:
+                emit_think: bool | None = None
+            else:
+                emit_think = req.reasoning_effort != "none"
             result = await chat_completions(
-                model       = req.model,
-                messages    = messages,
-                stream      = is_stream,
-                thinking    = req.thinking,
-                tools       = normalize_openai_tools(req.tools, req.functions),
-                tool_choice = normalize_openai_tool_choice(req.tool_choice, req.function_call),
-                temperature = req.temperature if req.temperature is not None else 0.8,
-                top_p       = req.top_p if req.top_p is not None else 0.95,
+                model=req.model,
+                messages=messages,
+                stream=is_stream,
+                emit_think=emit_think,
+                tools=req.tools,
+                tool_choice=req.tool_choice,
+                temperature=req.temperature or 0.8,
+                top_p=req.top_p or 0.95,
             )
 
     except AppError:
@@ -397,26 +317,37 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
         logger.exception(
             "chat completions endpoint failed: model={} stream={} error={}",
             req.model,
-            req.stream,
+            is_stream,
             exc,
         )
         if is_stream:
-            _err_msg = str(exc)  # capture before Python clears the except-scope variable
+            _err_msg = str(
+                exc
+            )  # capture before Python clears the except-scope variable
+
             async def _err_stream():
-                payload = orjson.dumps({"error": {"message": _err_msg, "type": "server_error"}}).decode()
+                payload = orjson.dumps(
+                    {"error": {"message": _err_msg, "type": "server_error"}}
+                ).decode()
                 yield f"event: error\ndata: {payload}\n\n"
                 yield "data: [DONE]\n\n"
-            return StreamingResponse(_err_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+            return StreamingResponse(
+                _err_stream(), media_type="text/event-stream", headers=_SSE_HEADERS
+            )
         raise
 
     if isinstance(result, dict):
         return JSONResponse(result)
-    return StreamingResponse(_safe_sse(result), media_type="text/event-stream", headers=_SSE_HEADERS)
+    return StreamingResponse(
+        _safe_sse(result), media_type="text/event-stream", headers=_SSE_HEADERS
+    )
 
 
 # ---------------------------------------------------------------------------
 # /v1/responses  (OpenAI Responses API)
 # ---------------------------------------------------------------------------
+
 
 async def _safe_sse_responses(stream) -> AsyncGenerator[str, None]:
     """SSE wrapper that converts errors to Responses API error events."""
@@ -425,16 +356,24 @@ async def _safe_sse_responses(stream) -> AsyncGenerator[str, None]:
             yield chunk
     except Exception as exc:
         from app.platform.errors import AppError
+
         if isinstance(exc, AppError):
             err = exc.to_dict()["error"]
         else:
-            err = {"message": str(exc), "type": "server_error", "code": None, "param": None}
+            err = {
+                "message": str(exc),
+                "type": "server_error",
+                "code": None,
+                "param": None,
+            }
         payload = orjson.dumps({"type": "error", **err}).decode()
         yield f"event: error\ndata: {payload}\n\n"
         yield "data: [DONE]\n\n"
 
 
-@router.post("/responses", tags=[_TAG_RESPONSES], dependencies=[Depends(verify_api_key)])
+@router.post(
+    "/responses", tags=[_TAG_RESPONSES], dependencies=[Depends(verify_api_key)]
+)
 async def responses_endpoint(req: ResponsesCreateRequest):
     from app.platform.config.snapshot import get_config
     from app.platform.errors import ValidationError as _ValidationError
@@ -443,13 +382,16 @@ async def responses_endpoint(req: ResponsesCreateRequest):
     if spec is None or not spec.enabled:
         raise _ValidationError(
             f"Model {req.model!r} does not exist or you do not have access to it.",
-            param="model", code="model_not_found",
+            param="model",
+            code="model_not_found",
         )
     if not req.input:
         raise _ValidationError("input cannot be empty", param="input")
 
-    cfg        = get_config()
-    is_stream  = bool(req.stream)
+    cfg = get_config()
+    is_stream = (
+        req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
+    )
 
     # Map reasoning param → emit_think flag.
     # reasoning=None → use config; reasoning.effort="none" → off; otherwise on.
@@ -461,16 +403,17 @@ async def responses_endpoint(req: ResponsesCreateRequest):
         emit_think = True
 
     from .responses import create as responses_create
+
     result = await responses_create(
-        model        = req.model,
-        input_val    = req.input,
-        instructions = req.instructions,
-        stream       = is_stream,
-        emit_think   = emit_think,
-        temperature  = req.temperature if req.temperature is not None else 0.8,
-        top_p        = req.top_p if req.top_p is not None else 0.95,
-        tools        = req.tools or None,
-        tool_choice  = normalize_openai_tool_choice(req.tool_choice, None),
+        model=req.model,
+        input_val=req.input,
+        instructions=req.instructions,
+        stream=is_stream,
+        emit_think=emit_think,
+        temperature=req.temperature or 0.8,
+        top_p=req.top_p or 0.95,
+        tools=req.tools or None,
+        tool_choice=req.tool_choice,
     )
 
     if isinstance(result, dict):
@@ -486,89 +429,91 @@ async def responses_endpoint(req: ResponsesCreateRequest):
 # /v1/images/generations (standalone image endpoint)
 # ---------------------------------------------------------------------------
 
-@router.get("/images/method", tags=[_TAG_IMAGES], dependencies=[Depends(verify_api_key)])
-async def image_generation_method():
-    return JSONResponse({"image_generation_method": _IMAGE_GENERATION_METHOD})
 
-
-@router.post("/images/generations", tags=[_TAG_IMAGES], dependencies=[Depends(verify_api_key)])
+@router.post(
+    "/images/generations", tags=[_TAG_IMAGES], dependencies=[Depends(verify_api_key)]
+)
 async def image_generations(req: ImageGenerationRequest):
     spec = model_registry.get(req.model)
     if spec is None or not spec.enabled or not spec.is_image():
-        raise ValidationError(f"Model {req.model!r} is not an image model", param="model")
-    n = req.n if req.n is not None else 1
-    _validate_image_n(req.model, n, param="n")
+        raise ValidationError(
+            f"Model {req.model!r} is not an image model", param="model"
+        )
+    _validate_image_n(req.model, req.n or 1, param="n")
 
     from .images import generate as img_gen
+
     result = await img_gen(
-        model           = req.model,
-        prompt          = req.prompt,
-        n               = n,
-        size            = req.size or "1024x1024",
-        response_format = req.response_format or "url",
-        stream          = bool(req.stream),
-        chat_format     = False,
+        model=req.model,
+        prompt=req.prompt,
+        n=req.n or 1,
+        size=req.size or "1024x1024",
+        response_format=req.response_format or "url",
+        stream=False,
+        chat_format=False,
     )
-    if isinstance(result, dict):
-        return JSONResponse(result)
-    return StreamingResponse(_safe_sse(result), media_type="text/event-stream", headers=_SSE_HEADERS)
+    return JSONResponse(result)
 
 
 # ---------------------------------------------------------------------------
 # /v1/videos (OpenAI videos.create surface)
 # ---------------------------------------------------------------------------
 
+
 @router.post("/videos", tags=[_TAG_VIDEOS], dependencies=[Depends(verify_api_key)])
 async def videos_create(
     model: Annotated[str, Form(...)],
     prompt: Annotated[str, Form(...)],
     seconds: Annotated[int, Form()] = 6,
-    video_length: Annotated[int | None, Form()] = None,
-    size: Annotated[str, Form()] = "720x1280",
-    aspect_ratio: Annotated[str | None, Form()] = None,
-    resolution_name: Annotated[str | None, Form()] = None,
-    resolution: Annotated[str | None, Form()] = None,
-    preset: Annotated[Literal["fun", "normal", "spicy", "custom"] | None, Form()] = None,
-    input_reference: Annotated[UploadFile | None, File()] = None,
-    input_reference_files: Annotated[list[UploadFile] | None, File(alias="input_reference[]")] = None,
+    size: Annotated[
+        Literal["720x1280", "1280x720", "1024x1024", "1024x1792", "1792x1024"], Form()
+    ] = "720x1280",
+    resolution_name: Annotated[Literal["480p", "720p"] | None, Form()] = None,
+    preset: Annotated[
+        Literal["fun", "normal", "spicy", "custom"] | None, Form()
+    ] = None,
+    input_reference: Annotated[
+        list[UploadFile] | None, File(alias="input_reference[]")
+    ] = None,
 ):
     from .video import create_video
 
-    reference_uploads: list[UploadFile] = []
-    if input_reference is not None:
-        reference_uploads.append(input_reference)
-    if input_reference_files:
-        reference_uploads.extend(input_reference_files)
-    references_payload = [
-        {"image_url": await _upload_to_data_uri(item, param=f"input_reference.{index}")}
-        for index, item in enumerate(reference_uploads[:7])
-    ] or None
+    references_payload = None
+    if input_reference:
+        references_payload = [
+            {"image_url": await _upload_to_data_uri(f, param="input_reference")}
+            for f in input_reference[:7]
+        ]
 
     result = await create_video(
         model=model or "grok-video",
         prompt=prompt,
-        seconds=video_length if video_length is not None else seconds,
-        size=_resolve_video_size_alias(size, aspect_ratio, param="aspect_ratio"),
-        resolution_name=_resolve_video_resolution_alias(
-            resolution_name,
-            resolution,
-            param="resolution",
-        ),
+        seconds=seconds,
+        size=size or "720x1280",
+        resolution_name=resolution_name,
         preset=preset,
         input_references=references_payload,
     )
     return JSONResponse(result)
 
 
-@router.get("/videos/{video_id}", tags=[_TAG_VIDEOS], dependencies=[Depends(verify_api_key)])
+@router.get(
+    "/videos/{video_id}", tags=[_TAG_VIDEOS], dependencies=[Depends(verify_api_key)]
+)
 async def videos_retrieve(video_id: str):
     from .video import retrieve
+
     return JSONResponse(await retrieve(video_id))
 
 
-@router.get("/videos/{video_id}/content", tags=[_TAG_VIDEOS], dependencies=[Depends(verify_api_key)])
+@router.get(
+    "/videos/{video_id}/content",
+    tags=[_TAG_VIDEOS],
+    dependencies=[Depends(verify_api_key)],
+)
 async def videos_content(video_id: str):
     from .video import content_path
+
     path = await content_path(video_id)
     return FileResponse(path, media_type="video/mp4", filename=f"{video_id}.mp4")
 
@@ -577,12 +522,14 @@ async def videos_content(video_id: str):
 # /v1/images/edits (standalone image-edit endpoint)
 # ---------------------------------------------------------------------------
 
-@router.post("/images/edits", tags=[_TAG_IMAGES], dependencies=[Depends(verify_api_key)])
+
+@router.post(
+    "/images/edits", tags=[_TAG_IMAGES], dependencies=[Depends(verify_api_key)]
+)
 async def image_edits(
     model: Annotated[str, Form(...)],
     prompt: Annotated[str, Form(...)],
-    image: Annotated[list[UploadFile] | None, File(alias="image[]")] = None,
-    image_plain: Annotated[list[UploadFile] | None, File(alias="image")] = None,
+    image: Annotated[list[UploadFile], File(..., alias="image[]")],
     mask: Annotated[UploadFile | None, File()] = None,
     n: Annotated[int, Form()] = 1,
     size: Annotated[str, Form()] = "1024x1024",
@@ -590,18 +537,18 @@ async def image_edits(
 ):
     spec = model_registry.get(model)
     if spec is None or not spec.enabled or not spec.is_image_edit():
-        raise ValidationError(f"Model {model!r} is not an image-edit model", param="model")
+        raise ValidationError(
+            f"Model {model!r} is not an image-edit model", param="model"
+        )
     if mask is not None:
         raise ValidationError("mask is not supported yet", param="mask")
     _validate_image_edit_n(n, param="n")
-    image_files = image or image_plain or []
-    if not image_files:
-        raise ValidationError("image is required", param="image")
 
     from .images import edit as img_edit
+
     image_inputs = [
         await _upload_to_data_uri(item, param=f"image.{index}")
-        for index, item in enumerate(image_files)
+        for index, item in enumerate(image)
     ]
     # Wrap input into a single-message conversation.
     content = [{"type": "text", "text": prompt}]
@@ -611,13 +558,13 @@ async def image_edits(
     )
     messages = [{"role": "user", "content": content}]
     result = await img_edit(
-        model           = model,
-        messages        = messages,
-        n               = n,
-        size            = size,
-        response_format = response_format,
-        stream          = False,
-        chat_format     = False,
+        model=model,
+        messages=messages,
+        n=n,
+        size=size,
+        response_format=response_format,
+        stream=False,
+        chat_format=False,
     )
     return JSONResponse(result)
 
@@ -625,6 +572,7 @@ async def image_edits(
 # ---------------------------------------------------------------------------
 # /v1/files/image — serve locally saved images
 # ---------------------------------------------------------------------------
+
 
 @router.get("/files/video", tags=[_TAG_FILES])
 async def serve_video(id: str = Query(..., description="Video file ID")):

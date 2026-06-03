@@ -6,11 +6,14 @@ mutation; this module provides a read-only snapshot for selector logic.
 """
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from app.control.proxy.models import (
     EgressNode, ClearanceBundle, EgressMode, ClearanceMode,
 )
 
+if TYPE_CHECKING:
+    from app.control.proxy import ProxyDirectory
 
 BundleKey = tuple[str, str]
 
@@ -22,7 +25,7 @@ class ProxyRuntimeTable:
     egress_mode:    EgressMode    = EgressMode.DIRECT
     clearance_mode: ClearanceMode = ClearanceMode.NONE
     nodes:          list[EgressNode]                  = field(default_factory=list)
-    bundles:        dict[BundleKey, ClearanceBundle]   = field(default_factory=dict)
+    bundles:        dict[BundleKey, ClearanceBundle]  = field(default_factory=dict)
 
     @property
     def node_count(self) -> int:

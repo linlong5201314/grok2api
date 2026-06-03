@@ -6,39 +6,10 @@ from pathlib import Path
 from app.platform.paths import data_path
 from .base import ConfigBackend
 
-_BACKEND_ALIASES = {
-    "postgres": "postgresql",
-    "pgsql": "postgresql",
-    "pg": "postgresql",
-    "mariadb": "mysql",
-}
-
 
 def get_config_backend_name() -> str:
     """Return the active config backend name (mirrors ACCOUNT_STORAGE)."""
-    return _normalize_backend(_get_backend_env())
-
-
-def _normalize_backend(raw: str) -> str:
-    val = str(raw or "").strip().lower()
-    return _BACKEND_ALIASES.get(val, val)
-
-
-def _get_backend_env() -> str:
-    # Backward compatibility: legacy deployments used SERVER_STORAGE_TYPE.
-    return (
-        os.getenv("ACCOUNT_STORAGE", "").strip()
-        or os.getenv("SERVER_STORAGE_TYPE", "").strip()
-        or "local"
-    )
-
-
-def _legacy_storage_url_for(expected_backend: str) -> str:
-    legacy_url = os.getenv("SERVER_STORAGE_URL", "").strip()
-    if not legacy_url:
-        return ""
-    legacy_backend = _normalize_backend(os.getenv("SERVER_STORAGE_TYPE", "local"))
-    return legacy_url if legacy_backend == expected_backend else ""
+    return os.getenv("ACCOUNT_STORAGE", "local").strip().lower()
 
 
 def create_config_backend() -> ConfigBackend:
@@ -77,9 +48,9 @@ def _make_redis() -> ConfigBackend:
     from redis.asyncio import Redis
     from .redis import RedisConfigBackend
 
-    url = os.getenv("ACCOUNT_REDIS_URL", "").strip() or _legacy_storage_url_for("redis")
+    url = os.getenv("ACCOUNT_REDIS_URL", "").strip()
     if not url:
-        raise ValueError("Redis config backend requires ACCOUNT_REDIS_URL (or legacy SERVER_STORAGE_URL for redis)")
+        raise ValueError("Redis config backend requires ACCOUNT_REDIS_URL")
     r = Redis.from_url(url, decode_responses=False)
     return RedisConfigBackend(r)
 
@@ -92,14 +63,14 @@ def _make_sql(dialect: str) -> ConfigBackend:
     )
 
     if dialect == "mysql":
-        url = os.getenv("ACCOUNT_MYSQL_URL", "").strip() or _legacy_storage_url_for("mysql")
+        url = os.getenv("ACCOUNT_MYSQL_URL", "").strip()
         if not url:
-            raise ValueError("MySQL config backend requires ACCOUNT_MYSQL_URL (or legacy SERVER_STORAGE_URL with SERVER_STORAGE_TYPE=mysql)")
+            raise ValueError("MySQL config backend requires ACCOUNT_MYSQL_URL")
         engine = create_mysql_engine(url)
     else:
-        url = os.getenv("ACCOUNT_POSTGRESQL_URL", "").strip() or _legacy_storage_url_for("postgresql")
+        url = os.getenv("ACCOUNT_POSTGRESQL_URL", "").strip()
         if not url:
-            raise ValueError("PostgreSQL config backend requires ACCOUNT_POSTGRESQL_URL (or legacy SERVER_STORAGE_URL with SERVER_STORAGE_TYPE=pgsql/postgres/postgresql)")
+            raise ValueError("PostgreSQL config backend requires ACCOUNT_POSTGRESQL_URL")
         engine = create_pgsql_engine(url)
 
     return SqlConfigBackend(engine, dialect=dialect, dispose_engine=False)

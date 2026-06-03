@@ -1,9 +1,9 @@
 """Control-plane proxy domain models."""
 
 from enum import IntEnum, StrEnum
-from typing import Any, Self
+from typing import Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class ProxyScope(StrEnum):

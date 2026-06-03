@@ -18,23 +18,17 @@ from app.control.model.enums import ModeId
 from app.control.model.registry import resolve as resolve_model
 from app.control.account.enums import FeedbackKind
 from app.dataplane.reverse.protocol.xai_chat import classify_line, StreamAdapter
+from app.products._account_selection import reserve_account, selection_max_retries
 
-from .chat import _sampling_model_config, _stream_chat, _extract_message, _resolve_image, _quota_sync, _fail_sync, _feedback_kind, _log_task_exception
+from .chat import _stream_chat, _extract_message, _resolve_image, _quota_sync, _fail_sync, _parse_retry_codes, _feedback_kind, _log_task_exception, _upstream_body_excerpt
 from .chat import _configured_retry_codes, _should_retry_upstream
-from .chat import _reserve_chat_account
 from ._format import (
     make_resp_id, build_resp_usage, make_resp_object, format_sse,
 )
 from app.dataplane.reverse.protocol.tool_prompt import (
-    build_tool_system_prompt, inject_into_message, tool_calls_to_xml,
+    build_tool_system_prompt, extract_tool_names, inject_into_message, tool_calls_to_xml,
 )
 from app.dataplane.reverse.protocol.tool_parser import parse_tool_calls
-from app.dataplane.reverse.protocol.tool_request import (
-    allowed_tool_names,
-    normalize_parsed_tool_calls,
-    validate_strict_tools,
-    validate_tool_choice_tools,
-)
 from ._tool_sieve import ToolSieve
 
 
@@ -53,8 +47,6 @@ def _to_chat_tools(tools: list[dict]) -> list[dict]:
     """
     normalised = []
     for tool in tools:
-        if not isinstance(tool, dict):
-            continue
         if tool.get("type") == "function" and "function" not in tool and "name" in tool:
             normalised.append({
                 "type": "function",
@@ -62,7 +54,6 @@ def _to_chat_tools(tools: list[dict]) -> list[dict]:
                     "name":        tool.get("name", ""),
                     "description": tool.get("description", ""),
                     "parameters":  tool.get("parameters"),
-                    "strict":      tool.get("strict"),
                 },
             })
         else:
@@ -169,13 +160,6 @@ def _parse_input(input_val: str | list) -> list[dict]:
             # Reconstruct as tool result message
             call_id = item.get("call_id", "")
             output  = item.get("output", "")
-            if isinstance(output, (dict, list)):
-                try:
-                    output = orjson.dumps(output).decode()
-                except Exception:
-                    output = str(output)
-            elif not isinstance(output, str):
-                output = "" if output is None else str(output)
             messages.append({
                 "role":         "tool",
                 "tool_call_id": call_id,
@@ -199,10 +183,7 @@ def _parse_input(input_val: str | list) -> list[dict]:
                     normalized.append({"type": "text", "text": part.get("text", "")})
                 elif ptype == "image":
                     src = part.get("image_url") or part.get("source") or {}
-                    if isinstance(src, dict):
-                        url = src.get("url", "")
-                    else:
-                        url = str(src or "")
+                    url = src.get("url", "")
                     if url:
                         normalized.append({"type": "image_url", "image_url": {"url": url}})
                 elif ptype == "input_image":
@@ -240,6 +221,7 @@ async def create(
 
     cfg     = get_config()
     spec    = resolve_model(model)
+    mode_id = int(spec.mode_id)   # cast once, reuse everywhere
 
     messages: list[dict] = []
     if instructions:
@@ -253,15 +235,11 @@ async def create(
     # Tool prompt injection — only modify the message text, never the Grok payload
     # Normalise to Chat Completions format first (Responses API uses a flat structure)
     tool_names: list[str] = []
-    chat_tools: list[dict] | None = None
-    validate_tool_choice_tools(tools, tool_choice)
     if tools:
         chat_tools = _to_chat_tools(tools)
-        validate_strict_tools(chat_tools)
-        tool_names = allowed_tool_names(chat_tools, tool_choice)
-        if tool_names:
-            tool_prompt = build_tool_system_prompt(chat_tools, tool_choice)
-            message = inject_into_message(message, tool_prompt)
+        tool_names = extract_tool_names(chat_tools)
+        tool_prompt = build_tool_system_prompt(chat_tools, tool_choice)
+        message = inject_into_message(message, tool_prompt)
         logger.info("responses tool injection: tool_names={} choice={}", tool_names, tool_choice)
 
     from app.dataplane.account import _directory as _acct_dir
@@ -269,13 +247,12 @@ async def create(
         raise RateLimitError("Account directory not initialised")
     directory = _acct_dir
 
-    max_retries  = cfg.get_int("retry.max_retries", 1)
+    max_retries  = selection_max_retries()
     retry_codes  = _configured_retry_codes(cfg)
     response_id  = make_resp_id("resp")
     reasoning_id = make_resp_id("rs")
     message_id   = make_resp_id("msg")
     timeout_s    = cfg.get_float("chat.timeout", 120.0)
-    model_config_override = _sampling_model_config(temperature, top_p)
 
     # -------------------------------------------------------------------------
     # Streaming
@@ -283,12 +260,11 @@ async def create(
     async def _run_stream() -> AsyncGenerator[str, None]:
         excluded: list[str] = []
         for attempt in range(max_retries + 1):
-            acct, selected_mode_id = await _reserve_chat_account(
+            acct, selected_mode_id = await reserve_account(
                 directory,
                 spec,
-                cfg,
-                now_s_override = now_s(),
-                exclude_tokens = excluded or None,
+                now_s_override=now_s(),
+                exclude_tokens=excluded or None,
             )
             if acct is None:
                 raise RateLimitError("No available accounts for this model tier")
@@ -306,6 +282,7 @@ async def create(
             sieve               = ToolSieve(tool_names) if tool_names else None
             tool_calls_emitted  = False
             detected_fc_items: list[dict] = []
+            collected_annotations: list[dict] = []
 
             try:
                 try:
@@ -320,7 +297,6 @@ async def create(
                         mode_id   = ModeId(selected_mode_id),
                         message   = message,
                         files     = files,
-                        model_config_override = model_config_override,
                         timeout_s = timeout_s,
                     ):
                         if tool_calls_emitted:
@@ -394,7 +370,6 @@ async def create(
                                 if sieve is not None:
                                     safe_text, calls = sieve.feed(ev.content)
                                     if calls is not None:
-                                        calls = normalize_parsed_tool_calls(calls, chat_tools)
                                         fc_items = _build_fc_items(calls)
                                         detected_fc_items = fc_items
                                         base_idx = 1 if reasoning_started else 0
@@ -436,6 +411,19 @@ async def create(
                                         "delta":         text_chunk,
                                     })
 
+                            elif ev.kind == "annotation" and ev.annotation_data:
+                                if message_started:
+                                    collected_annotations.append(ev.annotation_data)
+                                    msg_idx = 1 if reasoning_started else 0
+                                    yield format_sse("response.output_text.annotation.added", {
+                                        "type":             "response.output_text.annotation.added",
+                                        "item_id":          message_id,
+                                        "output_index":     msg_idx,
+                                        "content_index":    0,
+                                        "annotation_index": len(collected_annotations) - 1,
+                                        "annotation":       ev.annotation_data,
+                                    })
+
                             elif ev.kind == "soft_stop":
                                 ended = True
                                 break
@@ -445,36 +433,8 @@ async def create(
 
                     # Flush sieve after stream ends (incomplete XML at end of stream)
                     if sieve is not None and not tool_calls_emitted:
-                        flushed_text, calls = sieve.flush()
-                        if flushed_text:
-                            msg_idx = 1 if reasoning_started else 0
-                            if not message_started:
-                                message_started = True
-                                yield format_sse("response.output_item.added", {
-                                    "type":         "response.output_item.added",
-                                    "output_index": msg_idx,
-                                    "item":         {
-                                        "id": message_id, "type": "message",
-                                        "role": "assistant", "content": [], "status": "in_progress",
-                                    },
-                                })
-                                yield format_sse("response.content_part.added", {
-                                    "type":          "response.content_part.added",
-                                    "item_id":       message_id,
-                                    "output_index":  msg_idx,
-                                    "content_index": 0,
-                                    "part":          {"type": "output_text", "text": "", "annotations": []},
-                                })
-                            text_buf.append(flushed_text)
-                            yield format_sse("response.output_text.delta", {
-                                "type":          "response.output_text.delta",
-                                "item_id":       message_id,
-                                "output_index":  msg_idx,
-                                "content_index": 0,
-                                "delta":         flushed_text,
-                            })
+                        calls = sieve.flush()
                         if calls:
-                            calls = normalize_parsed_tool_calls(calls, chat_tools)
                             fc_items = _build_fc_items(calls)
                             detected_fc_items = fc_items
                             base_idx = 1 if reasoning_started else 0
@@ -509,91 +469,32 @@ async def create(
                         logger.info("responses stream tool_calls: attempt={}/{} model={}",
                                     attempt + 1, max_retries + 1, model)
                     else:
-                        full_think = "".join(think_buf)
-                        if reasoning_started and not reasoning_closed:
-                            reasoning_closed = True
-                            yield format_sse("response.reasoning_summary_text.done", {
-                                "type":          "response.reasoning_summary_text.done",
-                                "item_id":       reasoning_id,
-                                "output_index":  0,
-                                "summary_index": 0,
-                                "text":          full_think,
-                            })
-                            yield format_sse("response.reasoning_summary_part.done", {
-                                "type":          "response.reasoning_summary_part.done",
-                                "item_id":       reasoning_id,
-                                "output_index":  0,
-                                "summary_index": 0,
-                                "part":          {"type": "summary_text", "text": full_think},
-                            })
-                            yield format_sse("response.output_item.done", {
-                                "type":         "response.output_item.done",
-                                "output_index": 0,
-                                "item":         {
-                                    "id":      reasoning_id,
-                                    "type":    "reasoning",
-                                    "summary": [{"type": "summary_text", "text": full_think}],
-                                    "status":  "completed",
-                                },
-                            })
                         # Normal text path
                         msg_idx = 1 if reasoning_started else 0
                         for url, img_id in adapter.image_urls:
                             img_text = await _resolve_image(token, url, img_id)
                             img_md   = img_text + "\n"
                             text_buf.append(img_md)
-                            if not message_started:
-                                message_started = True
-                                yield format_sse("response.output_item.added", {
-                                    "type":         "response.output_item.added",
-                                    "output_index": msg_idx,
-                                    "item":         {
-                                        "id": message_id, "type": "message",
-                                        "role": "assistant", "content": [], "status": "in_progress",
-                                    },
-                                })
-                                yield format_sse("response.content_part.added", {
-                                    "type":          "response.content_part.added",
+                            if message_started:
+                                yield format_sse("response.output_text.delta", {
+                                    "type":          "response.output_text.delta",
                                     "item_id":       message_id,
                                     "output_index":  msg_idx,
                                     "content_index": 0,
-                                    "part":          {"type": "output_text", "text": "", "annotations": []},
+                                    "delta":         img_md,
                                 })
-                            yield format_sse("response.output_text.delta", {
-                                "type":          "response.output_text.delta",
-                                "item_id":       message_id,
-                                "output_index":  msg_idx,
-                                "content_index": 0,
-                                "delta":         img_md,
-                            })
 
                         references = adapter.references_suffix()
                         if references:
                             text_buf.append(references)
-                            if not message_started:
-                                message_started = True
-                                yield format_sse("response.output_item.added", {
-                                    "type":         "response.output_item.added",
-                                    "output_index": msg_idx,
-                                    "item":         {
-                                        "id": message_id, "type": "message",
-                                        "role": "assistant", "content": [], "status": "in_progress",
-                                    },
-                                })
-                                yield format_sse("response.content_part.added", {
-                                    "type":          "response.content_part.added",
+                            if message_started:
+                                yield format_sse("response.output_text.delta", {
+                                    "type":          "response.output_text.delta",
                                     "item_id":       message_id,
                                     "output_index":  msg_idx,
                                     "content_index": 0,
-                                    "part":          {"type": "output_text", "text": "", "annotations": []},
+                                    "delta":         references,
                                 })
-                            yield format_sse("response.output_text.delta", {
-                                "type":          "response.output_text.delta",
-                                "item_id":       message_id,
-                                "output_index":  msg_idx,
-                                "content_index": 0,
-                                "delta":         references,
-                            })
 
                         full_text = "".join(text_buf)
                         if message_started:
@@ -609,20 +510,26 @@ async def create(
                                 "item_id":       message_id,
                                 "output_index":  msg_idx,
                                 "content_index": 0,
-                                "part":          {"type": "output_text", "text": full_text, "annotations": []},
+                                "part":          {"type": "output_text", "text": full_text, "annotations": collected_annotations},
                             })
+                            # 构建 message item（流式 output_item.done + response.completed 共用）
+                            sources = adapter.search_sources_list()
+                            msg_item: dict = {
+                                "id":      message_id,
+                                "type":    "message",
+                                "role":    "assistant",
+                                "content": [{"type": "output_text", "text": full_text, "annotations": collected_annotations}],
+                                "status":  "completed",
+                            }
+                            if sources:
+                                msg_item["search_sources"] = sources
                             yield format_sse("response.output_item.done", {
                                 "type":         "response.output_item.done",
                                 "output_index": msg_idx,
-                                "item":         {
-                                    "id":      message_id,
-                                    "type":    "message",
-                                    "role":    "assistant",
-                                    "content": [{"type": "output_text", "text": full_text, "annotations": []}],
-                                    "status":  "completed",
-                                },
+                                "item":         msg_item,
                             })
 
+                        full_think = "".join(think_buf)
                         output = []
                         if reasoning_started and full_think:
                             output.append({
@@ -631,14 +538,19 @@ async def create(
                                 "summary": [{"type": "summary_text", "text": full_think}],
                                 "status":  "completed",
                             })
-                        if message_started or full_text:
-                            output.append({
+                        # 复用 msg_item（message_started 时已构建）；未启动时重新构建
+                        if not message_started:
+                            msg_item = {
                                 "id":      message_id,
                                 "type":    "message",
                                 "role":    "assistant",
-                                "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+                                "content": [{"type": "output_text", "text": full_text, "annotations": adapter.annotations_list()}],
                                 "status":  "completed",
-                            })
+                            }
+                            sources = adapter.search_sources_list()
+                            if sources:
+                                msg_item["search_sources"] = sources
+                        output.append(msg_item)
 
                         pt  = estimate_prompt_tokens(message)
                         ct  = estimate_tokens(full_text)
@@ -663,6 +575,14 @@ async def create(
                         logger.warning("responses stream retry scheduled: attempt={}/{} status={} token={}...",
                                        attempt + 1, max_retries, exc.status, token[:8])
                     else:
+                        logger.warning(
+                            "responses stream upstream failed: attempt={}/{} model={} status={} body={}",
+                            attempt + 1,
+                            max_retries + 1,
+                            model,
+                            exc.status,
+                            _upstream_body_excerpt(exc),
+                        )
                         raise
 
             finally:
@@ -688,12 +608,11 @@ async def create(
     token    = ""
     adapter  = StreamAdapter()
     for attempt in range(max_retries + 1):
-        acct, selected_mode_id = await _reserve_chat_account(
+        acct, selected_mode_id = await reserve_account(
             directory,
             spec,
-            cfg,
-            now_s_override = now_s(),
-            exclude_tokens = excluded or None,
+            now_s_override=now_s(),
+            exclude_tokens=excluded or None,
         )
         if acct is None:
             raise RateLimitError("No available accounts for this model tier")
@@ -711,7 +630,6 @@ async def create(
                     mode_id   = ModeId(selected_mode_id),
                     message   = message,
                     files     = files,
-                    model_config_override = model_config_override,
                     timeout_s = timeout_s,
                 ):
                     event_type, data = classify_line(line)
@@ -735,12 +653,20 @@ async def create(
                     logger.warning("responses retry scheduled: attempt={}/{} status={} token={}...",
                                    attempt + 1, max_retries, exc.status, token[:8])
                 else:
+                    logger.warning(
+                        "responses upstream failed: attempt={}/{} model={} status={} body={}",
+                        attempt + 1,
+                        max_retries + 1,
+                        model,
+                        exc.status,
+                        _upstream_body_excerpt(exc),
+                    )
                     raise
 
         finally:
             await directory.release(acct)
             kind = FeedbackKind.SUCCESS if success else _feedback_kind(fail_exc) if fail_exc else FeedbackKind.SERVER_ERROR
-            await directory.feedback(token, kind, selected_mode_id, now_s_val=now_s())
+            await directory.feedback(token, kind, selected_mode_id)
             if success:
                 asyncio.create_task(_quota_sync(token, selected_mode_id)).add_done_callback(_log_task_exception)
             else:
@@ -773,7 +699,6 @@ async def create(
     if tool_names:
         tc_result = parse_tool_calls(full_text, tool_names)
         if tc_result.calls:
-            tool_calls = normalize_parsed_tool_calls(tc_result.calls, chat_tools)
             output: list[dict] = []
             if full_think:
                 output.append({
@@ -782,11 +707,11 @@ async def create(
                     "summary": [{"type": "summary_text", "text": full_think}],
                     "status":  "completed",
                 })
-            output.extend(_build_fc_items(tool_calls))
+            output.extend(_build_fc_items(tc_result.calls))
             pt = estimate_prompt_tokens(message)
-            ct = estimate_tool_call_tokens(tool_calls)
+            ct = estimate_tool_call_tokens(tc_result.calls)
             rt = estimate_tokens(full_think) if full_think else 0
-            logger.info("responses tool_calls: model={} calls={}", model, len(tool_calls))
+            logger.info("responses tool_calls: model={} calls={}", model, len(tc_result.calls))
             return make_resp_object(
                 response_id, model, "completed", output,
                 build_resp_usage(pt, ct + rt, rt),
@@ -803,13 +728,17 @@ async def create(
             "summary": [{"type": "summary_text", "text": full_think}],
             "status":  "completed",
         })
-    output.append({
+    msg_item: dict = {
         "id":      message_id,
         "type":    "message",
         "role":    "assistant",
-        "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+        "content": [{"type": "output_text", "text": full_text, "annotations": adapter.annotations_list()}],
         "status":  "completed",
-    })
+    }
+    sources = adapter.search_sources_list()
+    if sources:
+        msg_item["search_sources"] = sources
+    output.append(msg_item)
 
     pt = estimate_prompt_tokens(message)
     ct = estimate_tokens(full_text)

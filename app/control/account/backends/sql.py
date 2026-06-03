@@ -46,6 +46,7 @@ accounts_table = sa.Table(
     sa.Column("quota_fast",       sa.Text,    nullable=False, default="{}"),
     sa.Column("quota_expert",     sa.Text,    nullable=False, default="{}"),
     sa.Column("quota_heavy",      sa.Text,    nullable=False, default="{}"),
+    sa.Column("quota_grok_4_3",   sa.Text,    nullable=False, default="{}"),
     sa.Column("usage_use_count",  sa.Integer, nullable=False, default=0),
     sa.Column("usage_fail_count", sa.Integer, nullable=False, default=0),
     sa.Column("usage_sync_count", sa.Integer, nullable=False, default=0),
@@ -58,13 +59,6 @@ accounts_table = sa.Table(
     sa.Column("deleted_at",       sa.BigInteger),
     sa.Column("ext",              sa.Text,    nullable=False, default="{}"),
     sa.Column("revision",         sa.BigInteger, nullable=False, default=0),
-    # Indexes — these mirror the SQLite local backend so all SQL dialects
-    # have parity.  ``metadata.create_all(checkfirst=True)`` skips creation
-    # when an index of the same name already exists.
-    sa.Index("idx_acc_revision",      "revision"),
-    sa.Index("idx_acc_pool_status",   "pool", "status"),
-    sa.Index("idx_acc_deleted_at",    "deleted_at"),
-    sa.Index("idx_acc_updated_at",    "updated_at"),
 )
 
 meta_table = sa.Table(
@@ -180,17 +174,6 @@ def _get_env_int(name: str, default: int, *, minimum: int = 0) -> int:
         return max(minimum, int(raw))
     except ValueError:
         return default
-
-
-def _get_env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name, "")
-    try:
-        parsed = _parse_ssl_bool(name, raw)
-    except ValueError:
-        return default
-    if parsed is None:
-        return default
-    return parsed
 
 
 def _normalize_ssl_mode(dialect: str, raw_mode: str) -> str:
@@ -339,58 +322,22 @@ def _build_mysql_ssl_context(mode: str, ssl_options: dict[str, str]) -> ssl.SSLC
 
 def _build_sql_connect_args(
     dialect: str,
-    normalized_url: str,
     ssl_options: dict[str, str],
 ) -> dict[str, Any] | None:
-    connect_args: dict[str, Any] = {}
     mode = _resolve_ssl_mode(dialect, ssl_options)
+    if not mode:
+        return None
 
     if dialect == "mysql":
-        if not mode:
-            return None
         ctx = _build_mysql_ssl_context(mode, ssl_options)
         return {"ssl": ctx} if ctx is not None else None
 
-    if mode:
-        _validate_pg_ssl_options(mode, ssl_options)
-        if mode != "disable":
-            # asyncpg does not accept ssl= as a plain string (e.g. "require").
-            # Always build a proper ssl.SSLContext so the driver can use it directly.
-            connect_args["ssl"] = _build_pg_ssl_context(mode, ssl_options)
-
-    statement_cache_size = _resolve_pg_statement_cache_size(normalized_url)
-    if statement_cache_size is not None:
-        connect_args["statement_cache_size"] = statement_cache_size
-        if statement_cache_size == 0:
-            connect_args["prepared_statement_cache_size"] = 0
-    return connect_args or None
-
-
-def _looks_like_supabase_pooler(normalized_url: str) -> bool:
-    parsed = urlparse(normalized_url)
-    host = (parsed.hostname or "").lower()
-    return parsed.port == 6543 or host.endswith("pooler.supabase.com")
-
-
-def _should_default_pg_statement_cache_zero(normalized_url: str) -> bool:
-    if _looks_like_supabase_pooler(normalized_url):
-        return True
-    return _is_serverless()
-
-
-def _resolve_pg_statement_cache_size(normalized_url: str) -> int | None:
-    raw = os.getenv("ACCOUNT_SQL_STATEMENT_CACHE_SIZE", "").strip()
-    if raw:
-        try:
-            return max(0, int(raw))
-        except ValueError:
-            pass
-
-    if _get_env_bool("ACCOUNT_SQL_DISABLE_STATEMENT_CACHE", False):
-        return 0
-    if _should_default_pg_statement_cache_zero(normalized_url):
-        return 0
-    return None
+    _validate_pg_ssl_options(mode, ssl_options)
+    if mode == "disable":
+        return None
+    # asyncpg does not accept ssl= as a plain string (e.g. "require").
+    # Always build a proper ssl.SSLContext so the driver can use it directly.
+    return {"ssl": _build_pg_ssl_context(mode, ssl_options)}
 
 
 def _prepare_sql_url_and_connect_args(
@@ -403,7 +350,7 @@ def _prepare_sql_url_and_connect_args(
         return normalized_url, None
 
     cleaned_url, ssl_options = _extract_sql_ssl_options(dialect, normalized_url)
-    return cleaned_url, _build_sql_connect_args(dialect, cleaned_url, ssl_options)
+    return cleaned_url, _build_sql_connect_args(dialect, ssl_options)
 
 
 def _is_serverless() -> bool:
@@ -458,92 +405,19 @@ def _evict_cached_engine(engine: AsyncEngine) -> None:
 def _row_to_record(row: Any) -> AccountRecord:
     d = dict(row._mapping)
     d["tags"]  = json.loads(d.get("tags")  or "[]")
-    heavy_raw  = d.pop("quota_heavy", "{}") or "{}"
-    heavy_dict = json.loads(heavy_raw)
+    heavy_raw     = d.pop("quota_heavy",    "{}") or "{}"
+    grok_4_3_raw  = d.pop("quota_grok_4_3", "{}") or "{}"
+    heavy_dict    = json.loads(heavy_raw)
+    grok_4_3_dict = json.loads(grok_4_3_raw)
     d["quota"] = {
         "auto":   json.loads(d.pop("quota_auto",   "{}") or "{}"),
         "fast":   json.loads(d.pop("quota_fast",   "{}") or "{}"),
         "expert": json.loads(d.pop("quota_expert", "{}") or "{}"),
-        **({"heavy": heavy_dict} if heavy_dict else {}),
+        **({"heavy":    heavy_dict}    if heavy_dict    else {}),
+        **({"grok_4_3": grok_4_3_dict} if grok_4_3_dict else {}),
     }
     d["ext"] = json.loads(d.get("ext") or "{}")
     return AccountRecord.model_validate(d)
-
-
-def _build_patch_updates(
-    patch: AccountPatch,
-    record: AccountRecord,
-    *,
-    ts:  int,
-    rev: int,
-) -> dict[str, Any]:
-    """Build the column → value dict for a single AccountPatch.
-
-    Pure function — does not touch the DB.  Called by ``patch_accounts`` once
-    per patch after a single bulk preload of all affected records.
-    """
-    updates: dict[str, Any] = {"updated_at": ts, "revision": rev}
-
-    if patch.pool is not None:
-        updates["pool"] = patch.pool
-    if patch.status is not None:
-        updates["status"] = patch.status.value
-    if patch.state_reason is not None:
-        updates["state_reason"] = patch.state_reason
-    if patch.last_use_at is not None:
-        updates["last_use_at"] = patch.last_use_at
-    if patch.last_fail_at is not None:
-        updates["last_fail_at"] = patch.last_fail_at
-    if patch.last_fail_reason is not None:
-        updates["last_fail_reason"] = patch.last_fail_reason
-    if patch.last_sync_at is not None:
-        updates["last_sync_at"] = patch.last_sync_at
-    if patch.last_clear_at is not None:
-        updates["last_clear_at"] = patch.last_clear_at
-    if patch.quota_auto is not None:
-        updates["quota_auto"] = json.dumps(patch.quota_auto)
-    if patch.quota_fast is not None:
-        updates["quota_fast"] = json.dumps(patch.quota_fast)
-    if patch.quota_expert is not None:
-        updates["quota_expert"] = json.dumps(patch.quota_expert)
-    if patch.quota_heavy is not None:
-        updates["quota_heavy"] = json.dumps(patch.quota_heavy)
-    if patch.usage_use_delta is not None:
-        updates["usage_use_count"] = max(0, record.usage_use_count + patch.usage_use_delta)
-    if patch.usage_fail_delta is not None:
-        updates["usage_fail_count"] = max(0, record.usage_fail_count + patch.usage_fail_delta)
-    if patch.usage_sync_delta is not None:
-        updates["usage_sync_count"] = max(0, record.usage_sync_count + patch.usage_sync_delta)
-
-    tags = list(record.tags)
-    if patch.tags is not None:
-        tags = list(patch.tags)
-    if patch.add_tags:
-        for t in patch.add_tags:
-            if t not in tags:
-                tags.append(t)
-    if patch.remove_tags:
-        tags = [t for t in tags if t not in patch.remove_tags]
-    updates["tags"] = json.dumps(tags)
-
-    ext = dict(record.ext)
-    if patch.ext_merge:
-        ext.update(patch.ext_merge)
-    if patch.clear_failures:
-        for k in (
-            "cooldown_until", "cooldown_reason", "disabled_at",
-            "disabled_reason", "expired_at", "expired_reason",
-            "forbidden_strikes",
-        ):
-            ext.pop(k, None)
-        updates["status"]           = AccountStatus.ACTIVE.value
-        updates["usage_fail_count"] = 0
-        updates["last_fail_at"]     = None
-        updates["last_fail_reason"] = None
-        updates["state_reason"]     = None
-    updates["ext"] = json.dumps(ext)
-
-    return updates
 
 
 class SqlAccountRepository:
@@ -628,6 +502,7 @@ class SqlAccountRepository:
     async def _do_initialize(self) -> None:
         async with self._engine.begin() as conn:
             await conn.run_sync(metadata.create_all)
+            await self._ensure_columns(conn)
             # Seed revision row.
             if self._dialect == "postgresql":
                 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -643,6 +518,51 @@ class SqlAccountRepository:
                     .values(key="revision", value="0")
                     .on_duplicate_key_update(value="0")
                 )
+
+    async def _ensure_columns(self, conn: Any) -> None:
+        """Idempotent ALTER TABLE migrations for columns added after the initial schema."""
+        existing = await self._table_columns(conn, _TBL_ACCOUNTS)
+        if "quota_grok_4_3" not in existing:
+            if self._dialect == "mysql":
+                # MySQL forbids DEFAULT values on TEXT/BLOB columns;
+                # add as nullable, backfill, then promote to NOT NULL.
+                await conn.exec_driver_sql(
+                    f"ALTER TABLE {_TBL_ACCOUNTS} "
+                    f"ADD COLUMN quota_grok_4_3 TEXT"
+                )
+                await conn.exec_driver_sql(
+                    f"UPDATE {_TBL_ACCOUNTS} "
+                    f"SET quota_grok_4_3 = '{{}}' "
+                    f"WHERE quota_grok_4_3 IS NULL"
+                )
+                await conn.exec_driver_sql(
+                    f"ALTER TABLE {_TBL_ACCOUNTS} "
+                    f"MODIFY COLUMN quota_grok_4_3 TEXT NOT NULL"
+                )
+            else:
+                await conn.exec_driver_sql(
+                    f"ALTER TABLE {_TBL_ACCOUNTS} "
+                    f"ADD COLUMN quota_grok_4_3 TEXT NOT NULL DEFAULT '{{}}'"
+                )
+
+    async def _table_columns(self, conn: Any, table: str) -> set[str]:
+        if self._dialect == "postgresql":
+            rows = await conn.execute(
+                sa.text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = :t"
+                ),
+                {"t": table},
+            )
+        else:
+            rows = await conn.execute(
+                sa.text(
+                    "SELECT COLUMN_NAME FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = :t"
+                ),
+                {"t": table},
+            )
+        return {str(r[0]).lower() for r in rows.fetchall()}
 
     async def initialize(self) -> None:
         await self._ensure_initialized()
@@ -720,7 +640,8 @@ class SqlAccountRepository:
                     "quota_auto":       json.dumps(qs.auto.to_dict()),
                     "quota_fast":       json.dumps(qs.fast.to_dict()),
                     "quota_expert":     json.dumps(qs.expert.to_dict()),
-                    "quota_heavy":      json.dumps(qs.heavy.to_dict()) if qs.heavy else "{}",
+                    "quota_heavy":      json.dumps(qs.heavy.to_dict())    if qs.heavy    else "{}",
+                    "quota_grok_4_3":   json.dumps(qs.grok_4_3.to_dict()) if qs.grok_4_3 else "{}",
                     "usage_use_count":  0,
                     "usage_fail_count": 0,
                     "usage_sync_count": 0,
@@ -735,69 +656,87 @@ class SqlAccountRepository:
         self,
         patches: list[AccountPatch],
     ) -> AccountMutationResult:
-        """Apply partial updates with grouped batch execution.
-
-        Performance:
-          - One ``SELECT ... WHERE token IN (...)`` to fetch all current
-            records (was: one SELECT per patch — N round-trips).
-          - Patches that touch the same column set are grouped together and
-            executed via ``conn.execute(stmt, [params...])`` so SQLAlchemy
-            emits a single executemany (was: one UPDATE round-trip per patch).
-
-        Net effect for a uniform bulk patch (e.g. NSFW tagging 100 tokens):
-          before: 1 + 2N round-trips (~201 for N=100)
-          after:  3 round-trips (revision bump, IN-SELECT, executemany)
-        """
         if not patches:
             return AccountMutationResult()
         await self._ensure_initialized()
-
-        # Deduplicate tokens for the preload SELECT — patches with duplicate
-        # tokens are rare but allowed; preload should still issue one query.
-        unique_tokens = list({p.token for p in patches})
-
         async with self._engine.begin() as conn:
             rev = await self._bump_revision(conn)
             ts  = now_ms()
-
-            # Preload current state in one IN query.
-            rows = (await conn.execute(
-                sa.select(accounts_table).where(
-                    accounts_table.c.token.in_(unique_tokens)
-                )
-            )).fetchall()
-            record_by_token: dict[str, AccountRecord] = {}
-            for r in rows:
-                rec = _row_to_record(r)
-                record_by_token[rec.token] = rec
-
-            # Group patches by their write-column signature so we can issue
-            # one executemany per group.
-            groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
             count = 0
             for patch in patches:
-                record = record_by_token.get(patch.token)
-                if record is None:
+                row = (await conn.execute(
+                    sa.select(accounts_table).where(accounts_table.c.token == patch.token)
+                )).fetchone()
+                if row is None:
                     continue
-                updates = _build_patch_updates(patch, record, ts=ts, rev=rev)
-                sig = tuple(sorted(updates.keys()))
-                groups.setdefault(sig, []).append({**updates, "_token": patch.token})
-                count += 1
+                record = _row_to_record(row)
 
-            # Emit one UPDATE per signature group.  For a single-row group
-            # SQLAlchemy still uses the regular execute path; multi-row groups
-            # become executemany.
-            for sig, params_list in groups.items():
-                stmt = (
+                updates: dict[str, Any] = {"updated_at": ts, "revision": rev}
+                if patch.pool is not None:
+                    updates["pool"] = patch.pool
+                if patch.status is not None:
+                    updates["status"] = patch.status.value
+                if patch.state_reason is not None:
+                    updates["state_reason"] = patch.state_reason
+                if patch.last_use_at is not None:
+                    updates["last_use_at"] = patch.last_use_at
+                if patch.last_fail_at is not None:
+                    updates["last_fail_at"] = patch.last_fail_at
+                if patch.last_fail_reason is not None:
+                    updates["last_fail_reason"] = patch.last_fail_reason
+                if patch.last_sync_at is not None:
+                    updates["last_sync_at"] = patch.last_sync_at
+                if patch.last_clear_at is not None:
+                    updates["last_clear_at"] = patch.last_clear_at
+                if patch.quota_auto is not None:
+                    updates["quota_auto"] = json.dumps(patch.quota_auto)
+                if patch.quota_fast is not None:
+                    updates["quota_fast"] = json.dumps(patch.quota_fast)
+                if patch.quota_expert is not None:
+                    updates["quota_expert"] = json.dumps(patch.quota_expert)
+                if patch.quota_heavy is not None:
+                    updates["quota_heavy"] = json.dumps(patch.quota_heavy)
+                if patch.quota_grok_4_3 is not None:
+                    updates["quota_grok_4_3"] = json.dumps(patch.quota_grok_4_3)
+                if patch.usage_use_delta is not None:
+                    updates["usage_use_count"] = max(0, record.usage_use_count + patch.usage_use_delta)
+                if patch.usage_fail_delta is not None:
+                    updates["usage_fail_count"] = max(0, record.usage_fail_count + patch.usage_fail_delta)
+                if patch.usage_sync_delta is not None:
+                    updates["usage_sync_count"] = max(0, record.usage_sync_count + patch.usage_sync_delta)
+
+                tags = list(record.tags)
+                if patch.tags is not None:
+                    tags = patch.tags
+                if patch.add_tags:
+                    for t in patch.add_tags:
+                        if t not in tags:
+                            tags.append(t)
+                if patch.remove_tags:
+                    tags = [t for t in tags if t not in patch.remove_tags]
+                updates["tags"] = json.dumps(tags)
+
+                ext = dict(record.ext)
+                if patch.ext_merge:
+                    ext.update(patch.ext_merge)
+                if patch.clear_failures:
+                    for k in ("cooldown_until", "cooldown_reason", "disabled_at",
+                              "disabled_reason", "expired_at", "expired_reason",
+                              "forbidden_strikes"):
+                        ext.pop(k, None)
+                    updates["status"]           = AccountStatus.ACTIVE.value
+                    updates["usage_fail_count"] = 0
+                    updates["last_fail_at"]     = None
+                    updates["last_fail_reason"] = None
+                    updates["state_reason"]     = None
+                updates["ext"] = json.dumps(ext)
+
+                await conn.execute(
                     accounts_table.update()
-                    .where(accounts_table.c.token == sa.bindparam("_token"))
-                    .values({col: sa.bindparam(col) for col in sig})
+                    .where(accounts_table.c.token == patch.token)
+                    .values(**updates)
                 )
-                if len(params_list) == 1:
-                    await conn.execute(stmt, params_list[0])
-                else:
-                    await conn.execute(stmt, params_list)
-
+                count += 1
             return AccountMutationResult(patched=count, revision=rev)
 
     async def delete_accounts(
@@ -905,18 +844,7 @@ class SqlAccountRepository:
 
 def _engine_cache_key(dialect: str, normalized_url: str, connect_args: dict[str, Any] | None) -> tuple[str, str, str]:
     """Build a stable cache key from the normalized URL and connect args."""
-    if not connect_args:
-        return (dialect, normalized_url, "")
-
-    normalized_items: list[tuple[str, Any]] = []
-    for key, value in sorted(connect_args.items(), key=lambda kv: kv[0]):
-        if isinstance(value, ssl.SSLContext):
-            normalized_items.append(
-                (key, ("SSLContext", int(value.verify_mode), bool(value.check_hostname)))
-            )
-        else:
-            normalized_items.append((key, value))
-    args_key = str(normalized_items)
+    args_key = str(sorted(connect_args.items(), key=lambda kv: kv[0])) if connect_args else ""
     return (dialect, normalized_url, args_key)
 
 

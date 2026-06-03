@@ -41,10 +41,10 @@ class MessagesRequest(BaseModel):
     messages:    list[_Message]
     system:      Any = None          # string or array of content blocks
     max_tokens:  int | None = None   # ignored (Grok doesn't expose this param)
-    stream:      bool | None = False
+    stream:      bool | None = None
     temperature: float | None = None
     top_p:       float | None = None
-    tools:       list[Any] | None = None
+    tools:       list[dict] | None = None
     tool_choice: Any = None
     thinking:    Any = None          # {type:"enabled", budget_tokens:N} — used to enable thinking output
 
@@ -92,7 +92,7 @@ async def messages_endpoint(req: MessagesRequest):
         raise ValidationError("messages cannot be empty", param="messages")
 
     cfg       = get_config()
-    is_stream = bool(req.stream)
+    is_stream = req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
 
     # thinking flag: enable when request has thinking config or config default
     if req.thinking is not None and isinstance(req.thinking, dict):
@@ -110,8 +110,8 @@ async def messages_endpoint(req: MessagesRequest):
         system       = req.system,
         stream       = is_stream,
         emit_think   = emit_think,
-        temperature  = req.temperature if req.temperature is not None else 0.8,
-        top_p        = req.top_p if req.top_p is not None else 0.95,
+        temperature  = req.temperature or 0.8,
+        top_p        = req.top_p or 0.95,
         tools        = req.tools or None,
         tool_choice  = req.tool_choice,
     )
