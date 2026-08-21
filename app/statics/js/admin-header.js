@@ -563,17 +563,14 @@ window.renderAdminHeader = async function renderAdminHeader() {
   await loadVersion();
 
   try {
-    const cachedHtml = window.__grok2apiAdminHeaderHtml || readSessionCache(HEADER_HTML_CACHE_KEY);
-    if (cachedHtml) {
-      mount.innerHTML = cachedHtml;
-    } else {
-      const res = await fetch('/static/admin/header.html');
-      if (!res.ok) throw new Error('header unavailable');
-      const html = await res.text();
-      mount.innerHTML = html;
-      window.__grok2apiAdminHeaderHtml = html;
-      writeSessionCache(HEADER_HTML_CACHE_KEY, html);
-    }
+    // Always revalidate header.html — sessionStorage caching here served
+    // stale navbars after deployments added new entries. The file is tiny;
+    // one request per page load is negligible next to correctness.
+    const res = await fetch('/static/admin/header.html', { cache: 'no-store' });
+    if (!res.ok) throw new Error('header unavailable');
+    const html = await res.text();
+    mount.innerHTML = html;
+    window.__grok2apiAdminHeaderHtml = html;
   } catch {
     mount.innerHTML = `
       <header class="admin-header">

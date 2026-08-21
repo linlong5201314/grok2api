@@ -253,12 +253,13 @@ function renderNodes(data) {
   }
   const maxScore = Math.max(...list.map(n => n.score || 0), 1);
   tbody.innerHTML = list.map(n => {
-    const rankCls = n.rank <= 3 ? 'top' : '';
+    const usable = n.usable !== false;
+    const rankCls = n.rank != null && n.rank <= 3 ? 'top' : '';
     const lat = n.latency_ms != null ? `${Math.round(n.latency_ms)} ms` : '—';
     const lossPct = Math.round((n.loss_rate || 0) * 100);
     const scorePct = Math.min(100, Math.round(((n.score || 0) / maxScore) * 100));
-    return `<tr>
-      <td><span class="rank-chip ${rankCls}">${n.rank}</span></td>
+    return `<tr${usable ? '' : ' style="opacity:.45"'}>
+      <td><span class="rank-chip ${rankCls}">${n.rank != null ? n.rank : '—'}</span></td>
       <td style="font-weight:600">${esc(n.name || n.node_id)}</td>
       <td><span class="proto-chip">${esc(n.protocol)}</span></td>
       <td style="font-family:Consolas,monospace;font-size:11px">${esc(n.server_masked)}:${n.port}</td>

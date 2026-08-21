@@ -266,3 +266,30 @@ class TestCoreFailureCleanup:
         await mgr._rebuild_egress()
         assert mgr._nodes["v1"].state == NodeState.NEEDS_CORE
         assert mgr._nodes["v1"].egress_url == ""
+
+
+class TestEmptyFetchKeepsPool:
+    """Airports throttle rapid re-pulls with empty bodies — never wipe a
+    working pool because of one bad fetch."""
+
+    @pytest.mark.asyncio
+    async def test_empty_fetch_keeps_existing_nodes(self):
+        mgr = SubscriptionManager()
+        TestPersistentStickyBinding._seed(mgr, {"A": 7.0, "B": 3.0})
+        before = len(mgr._nodes)
+        merged = mgr._merge_nodes("s1", [])
+        assert merged == before
+        assert len(mgr._nodes) == before
+
+    @pytest.mark.asyncio
+    async def test_empty_fetch_on_unknown_source_is_noop(self):
+        mgr = SubscriptionManager()
+        assert mgr._merge_nodes("ghost", []) == 0
+
+    @pytest.mark.asyncio
+    async def test_nonempty_fetch_still_replaces(self):
+        mgr = SubscriptionManager()
+        TestPersistentStickyBinding._seed(mgr, {"A": 7.0, "B": 3.0})
+        fresh = [_live_node("C", "10.9.9.9", 5.0)]
+        mgr._merge_nodes("s1", fresh)
+        assert set(mgr._nodes) == {"C"}  # old A/B replaced by C

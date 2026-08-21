@@ -197,7 +197,20 @@ class SubscriptionManager:
         )
 
     def _merge_nodes(self, source_id: str, fresh: list[SubNode]) -> int:
-        """Replace this source's nodes, preserving stats of surviving nodes."""
+        """Replace this source's nodes, preserving stats of surviving nodes.
+
+        An empty fresh list is treated as a transient upstream failure
+        (airports throttle rapid re-pulls with empty/error bodies) — the
+        last-known-good pool is KEPT instead of being wiped.
+        """
+        if not fresh and any(n.source_id == source_id for n in self._nodes.values()):
+            logger.warning(
+                "subscription returned 0 nodes (likely throttled); "
+                "keeping existing pool: source={}",
+                source_id,
+            )
+            self._update_stats()
+            return len(self._nodes)
         fresh_ids = {n.node_id for n in fresh}
         for nid in [
             nid

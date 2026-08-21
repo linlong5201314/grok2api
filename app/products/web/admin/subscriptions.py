@@ -134,6 +134,13 @@ async def refresh_subscriptions():
 async def list_nodes():
     manager = get_subscription_manager()
     ranked = manager.ranked_nodes()
+    # Surface nodes that parsed but cannot egress yet (needs_core / dead)
+    # so the panel shows them greyed out instead of an empty table.
+    shown = {n.node_id for n in ranked}
+    pending = sorted(
+        (n for n in manager._nodes.values() if n.node_id not in shown),  # noqa: SLF001
+        key=lambda n: n.node_id,
+    )
     running = _speedtest_task is not None and not _speedtest_task.done()
     return _json(
         {
@@ -142,8 +149,17 @@ async def list_nodes():
                 {
                     **n.redacted(),
                     "rank": i + 1,
+                    "usable": True,
                 }
                 for i, n in enumerate(ranked)
+            ]
+            + [
+                {
+                    **n.redacted(),
+                    "rank": None,
+                    "usable": False,
+                }
+                for n in pending
             ],
         }
     )
