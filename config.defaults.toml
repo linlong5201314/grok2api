@@ -36,6 +36,8 @@ auto_chat_mode_fallback = true
 thinking_summary = false
 # 是否动态生成 Statsig 指纹
 dynamic_statsig = true
+# 每账号稳定指纹：同一账号始终使用相同 UA/语言（一致设备），不同账号指纹互不相同
+per_account_fingerprint = true
 # 是否允许生成 NSFW 图片
 enable_nsfw = true
 # 搜索信源始终以 search_sources 结构化字段输出（无需此开关）。
@@ -72,7 +74,8 @@ video_max_mb = 0
 
 # ==================== 代理配置 ====================
 [proxy.egress]
-# 出口模式：direct | single_proxy | proxy_pool
+# 出口模式：direct | single_proxy | proxy_pool | subscription
+# subscription = 机场订阅模式：自动拉取订阅、测速排序、按账号绑定最优节点
 mode = "direct"
 # 基础代理 URL（API 流量，single_proxy 模式必填）
 proxy_url = ""
@@ -84,6 +87,30 @@ resource_proxy_url = ""
 resource_proxy_pool = []
 # 跳过代理 SSL 证书验证（代理使用自签名证书时启用）
 skip_ssl_verify = false
+
+[proxy.subscription]
+# 机场订阅链接列表（支持 base64 节点列表 / Clash YAML；也可在后台页面添加）
+urls = []
+# 订阅自动刷新间隔（秒，最小 300）
+refresh_interval_sec = 3600
+# 节点测速间隔（秒，最小 120）
+speedtest_interval_sec = 1800
+# 单节点探测超时（秒）
+speedtest_timeout_sec = 6.0
+# 并发探测数
+speedtest_concurrency = 8
+# 参与选路的节点上限（按评分取前 N）
+max_nodes = 64
+# 每账号粘性候选节点数：账号在其间稳定绑定一个出口 IP（防关联跳 IP）
+affinity_spread = 3
+# 拉取订阅时使用的 User-Agent（机场按 UA 下发不同格式）
+fetch_user_agent = "ClashMetaForAndroid/2.11.5.Meta"
+# sing-box 可执行文件路径（可选；配置后 vmess/vless/trojan/ss 节点经本地 core 出口）
+core_path = ""
+# 本地 mixed 入站起始端口（每个核心协议节点占用一个）
+core_start_port = 21001
+# 测速探测目标 URL（任何能快速返回 HTTP 状态码的地址）
+probe_url = "https://grok.com/"
 
 [proxy.clearance]
 # Cloudflare clearance 模式：none | manual | flaresolverr
@@ -100,6 +127,13 @@ flaresolverr_url = ""
 timeout_sec = 60
 # Clearance 刷新间隔（秒）
 refresh_interval = 3600
+
+[proxy.fingerprint]
+# 上游 Sentry release 哈希（grok.com 前端发布后会变化，可在后台更新）
+sentry_release = ""
+sentry_public_key = ""
+# 未启用每账号指纹时的全局 Accept-Language
+accept_language = "en-US,en;q=0.9"
 
 
 # ==================== 重试策略 ====================

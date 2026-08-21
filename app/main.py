@@ -237,11 +237,15 @@ async def lifespan(app: FastAPI):
     # 5. Initialise proxy directory and start clearance refresh scheduler.
     from app.control.proxy import get_proxy_directory
     from app.control.proxy.scheduler import ProxyClearanceScheduler
+    from app.control.proxy.scheduler_sub import SubscriptionScheduler
 
     proxy_dir = await get_proxy_directory()
     proxy_scheduler = ProxyClearanceScheduler(proxy_dir)
+    sub_scheduler = SubscriptionScheduler()
     if is_leader:
         proxy_scheduler.start()
+        if proxy_dir.egress_mode.value == "subscription":
+            sub_scheduler.start()
 
     logger.info("application startup completed")
     yield
@@ -259,6 +263,7 @@ async def lifespan(app: FastAPI):
     if is_leader:
         scheduler.stop()
         proxy_scheduler.stop()
+        await sub_scheduler.stop()
         _release_scheduler_lock()
 
     set_refresh_scheduler(None)
@@ -339,6 +344,20 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Security headers — harden the admin/webui surfaces without affecting
+    # API clients.  no-store keeps authenticated responses out of caches.
+    @app.middleware("http")
+    async def _security_headers(request: Request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if not path.startswith("/v1/"):
+            response.headers.setdefault("X-Content-Type-Options", "nosniff")
+            response.headers.setdefault("X-Frame-Options", "DENY")
+            response.headers.setdefault("Referrer-Policy", "no-referrer")
+            if path.startswith(("/admin/api", "/webui/api")):
+                response.headers.setdefault("Cache-Control", "no-store")
+        return response
 
     # Ensure config is loaded on every request.
     @app.middleware("http")

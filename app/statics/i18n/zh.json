@@ -33,7 +33,8 @@
     "versionUnavailable": "查询更新失败。",
     "versionNotesEmpty": "暂无更新说明。",
     "versionOpenRelease": "发布详情",
-    "versionClose": "关闭"
+    "versionClose": "关闭",
+    "subscriptions": "订阅管理"
   },
   "webui": {
     "header": {
@@ -353,7 +354,8 @@
         "timeouts": "请求超时设置",
         "imageProtocol": "NSFW 与图像协议",
         "logging": "日志配置",
-        "localMediaCache": "本地媒体缓存"
+        "localMediaCache": "本地媒体缓存",
+        "subscription": "机场订阅"
       },
       "options": {
         "imageFormat": {
@@ -372,7 +374,8 @@
         "proxyMode": {
           "direct": "直连",
           "singleProxy": "代理（固定）",
-          "proxyPool": "代理（轮转）"
+          "proxyPool": "代理（轮转）",
+          "subscription": "机场订阅"
         },
         "clearanceMode": {
           "none": "关闭",
@@ -625,6 +628,30 @@
         "logMaxFiles": {
           "label": "日志保留天数",
           "desc": "按天轮转时最多保留的日志文件数量。默认 7。"
+        },
+        "subUrls": {
+          "label": "订阅链接",
+          "desc": "机场订阅 URL，每行一个；也可在「订阅管理」页面添加。修改后需在订阅页触发一次刷新。"
+        },
+        "subRefresh": {
+          "label": "订阅刷新间隔（秒）",
+          "desc": "自动重新拉取订阅的周期，最小 300 秒。"
+        },
+        "subSpeedtest": {
+          "label": "节点测速间隔（秒）",
+          "desc": "后台自动测速周期，最小 120 秒；评分用于选路与账号绑定。"
+        },
+        "subAffinity": {
+          "label": "账号粘性候选数",
+          "desc": "每个账号在评分前 N 的节点中稳定绑定一个出口 IP，防止账号跳 IP 触发风控。"
+        },
+        "subMaxNodes": {
+          "label": "参与选路节点上限",
+          "desc": "按评分取前 N 个节点参与出口选择。"
+        },
+        "subCorePath": {
+          "label": "sing-box 路径（可选）",
+          "desc": "配置后 vmess/vless/trojan/ss/hysteria2 节点经本地 sing-box 出口；留空则仅直连协议可用。"
         }
       }
     }
@@ -699,5 +726,54 @@
     "startFailed": "启动失败：{message}",
     "cancelInProgress": "已暂停，请耐心等待本批次完成…",
     "na": "—"
+  },
+  "subs": {
+    "pageTitle": "Grok2API - 订阅管理",
+    "title": "订阅管理",
+    "subtitle": "机场订阅 · 节点测速 · 按账号绑定最优线路",
+    "speedtest": "一键测速",
+    "refreshAll": "刷新全部订阅",
+    "statSources": "订阅源",
+    "statNodes": "节点总数",
+    "statUsable": "可用节点",
+    "statHealthy": "健康节点",
+    "sourcesTitle": "机场订阅",
+    "sourcesHint": "支持 base64 节点列表与 Clash YAML，凭据不会回显",
+    "namePlaceholder": "备注名",
+    "urlPlaceholder": "https://example.com/api/v1/client/subscribe?token=...",
+    "noSources": "暂无订阅源，添加后自动拉取节点",
+    "nodesTitle": "节点排行",
+    "loading": "加载中…",
+    "noNodes": "暂无节点，先添加订阅源",
+    "colName": "名称",
+    "colProto": "协议",
+    "colServer": "服务器",
+    "colLatency": "延迟",
+    "colLoss": "丢包率",
+    "colScore": "评分",
+    "colState": "状态",
+    "needUrl": "请填写订阅链接",
+    "added": "订阅已添加",
+    "fetchFailed": "拉取失败，请检查链接",
+    "confirmDelete": "确定删除该订阅及其节点？",
+    "refreshing": "正在刷新订阅…",
+    "refreshed": "订阅已刷新",
+    "testStarted": "测速已开始",
+    "alreadyTesting": "测速进行中，请稍候",
+    "testing": "测速中…",
+    "notFetched": "尚未拉取",
+    "nodeCount": "节点数",
+    "nodesUnit": "个节点",
+    "coreRunning": "sing-box core 运行中：vmess/vless/trojan/ss 经本地端口出口",
+    "enable": "启用",
+    "disable": "停用",
+    "refresh": "刷新",
+    "state": {
+      "healthy": "健康",
+      "degraded": "波动",
+      "dead": "失效",
+      "new": "待测",
+      "needsCore": "需 Core"
+    }
   }
 }

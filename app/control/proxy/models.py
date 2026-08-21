@@ -21,6 +21,7 @@ class EgressMode(StrEnum):
     DIRECT       = "direct"        # no proxy
     SINGLE_PROXY = "single_proxy"  # one fixed proxy URL
     PROXY_POOL   = "proxy_pool"    # rotate from a pool
+    SUBSCRIPTION = "subscription"  # airport subscriptions, speed-ranked
 
 
 class ClearanceMode(StrEnum):
@@ -89,6 +90,10 @@ class ProxyLease(BaseModel):
     scope:       ProxyScope    = ProxyScope.APP
     kind:        RequestKind   = RequestKind.HTTP
     acquired_at: int           = 0   # ms
+    # Stable per-account identity seed (account token).  Drives deterministic
+    # UA / Accept-Language selection so one account always looks like the same
+    # device while different accounts do not share fingerprints.
+    fingerprint_seed: str      = ""
 
     @property
     def has_proxy(self) -> bool:

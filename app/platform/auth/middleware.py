@@ -2,9 +2,14 @@
 
 import hmac
 
-from fastapi import Header, HTTPException, Query, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Header, HTTPException, Query, Request, status
+from fastapi.security import HTTPBearer
 
+from app.platform.auth.ratelimit import (
+    check_lockout,
+    record_failure,
+    record_success,
+)
 from app.platform.config.snapshot import get_config
 
 _security = HTTPBearer(auto_error=False, scheme_name="API Key")
@@ -79,30 +84,38 @@ async def verify_api_key(
 
 
 async def verify_admin_key(
+    request: Request,
     authorization: str | None = Header(default=None),
     app_key: str | None = Query(default=None),
 ) -> None:
     """Validate Bearer token against ``app.app_key`` (admin access).
 
     Accepts either ``Authorization: Bearer <key>`` header or ``?app_key=<key>``
-    query parameter (the latter is needed for EventSource which cannot send headers).
+    query parameter (the latter is needed for EventSource which cannot send
+    headers).  Failed attempts are rate-limited per client IP.
     """
+    check_lockout(request)
     key = get_admin_key()
     if not key:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Admin key is not configured.")
 
     token = _extract_bearer(authorization) or app_key
     if token is None:
+        record_failure(request)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing authentication token.")
 
     if not hmac.compare_digest(token, key):
+        record_failure(request)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid authentication token.")
+    record_success(request)
 
 
 async def verify_webui_key(
+    request: Request,
     authorization: str | None = Header(default=None),
 ) -> None:
-    """Validate Bearer token for webui endpoints."""
+    """Validate Bearer token for webui endpoints (rate-limited)."""
+    check_lockout(request)
     webui_key = get_webui_key()
 
     if not webui_key:
@@ -112,10 +125,13 @@ async def verify_webui_key(
 
     token = _extract_bearer(authorization)
     if token is None:
+        record_failure(request)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing authentication token.")
 
     if not hmac.compare_digest(token, webui_key):
+        record_failure(request)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid authentication token.")
+    record_success(request)
 
 __all__ = [
     "verify_api_key",

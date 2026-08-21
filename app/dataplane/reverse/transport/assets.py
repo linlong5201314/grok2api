@@ -71,7 +71,7 @@ async def _list_assets_inner(
     timeout_s = cfg.get_float("asset.list_timeout", 30.0)
 
     proxy = await get_proxy_runtime()
-    lease = await proxy.acquire(scope=ProxyScope.ASSET, kind=RequestKind.HTTP)
+    lease = await proxy.acquire(affinity_key=token, scope=ProxyScope.ASSET, kind=RequestKind.HTTP)
 
     try:
         result = await get_json(
@@ -118,7 +118,7 @@ async def _delete_asset_inner(token: str, asset_id: str) -> dict:
     timeout_s = cfg.get_float("asset.delete_timeout", 30.0)
 
     proxy = await get_proxy_runtime()
-    lease = await proxy.acquire(scope=ProxyScope.ASSET, kind=RequestKind.HTTP)
+    lease = await proxy.acquire(affinity_key=token, scope=ProxyScope.ASSET, kind=RequestKind.HTTP)
 
     try:
         result = await delete_json(
@@ -194,7 +194,7 @@ async def download_asset(
     }
 
     proxy = await get_proxy_runtime()
-    lease = await proxy.acquire(scope=ProxyScope.ASSET, kind=RequestKind.HTTP)
+    lease = await proxy.acquire(affinity_key=token, scope=ProxyScope.ASSET, kind=RequestKind.HTTP)
 
     try:
         stream = await get_bytes_stream(

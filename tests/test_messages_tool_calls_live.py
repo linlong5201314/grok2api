@@ -241,7 +241,7 @@ def test_required_stream() -> tuple[str, str, dict]:
         _check_stream_end(events)
         return "", "", {}
 
-    ok(f"content_block_start (tool_use) received")
+    ok("content_block_start (tool_use) received")
     cb = tool_starts[0]["data"]["content_block"]
     tool_id   = cb.get("id", "")
     tool_name = cb.get("name", "")

@@ -99,6 +99,7 @@ async def _grpc_call(
     if not shared:
         proxy = await get_proxy_runtime()
         lease = await proxy.acquire(
+            affinity_key=token,
             scope=ProxyScope.APP,
             kind=RequestKind.HTTP,
             clearance_origin=origin,
@@ -195,6 +196,7 @@ async def set_birth_date(
     if not shared:
         proxy = await get_proxy_runtime()
         lease = await proxy.acquire(
+            affinity_key=token,
             scope=ProxyScope.APP,
             kind=RequestKind.HTTP,
             clearance_origin=GROK_ORIGIN,
@@ -238,6 +240,7 @@ async def nsfw_sequence(token: str) -> None:
 
     proxy = await get_proxy_runtime()
     lease = await proxy.acquire(
+        affinity_key=token,
         scope=ProxyScope.APP,
         kind=RequestKind.HTTP,
         clearance_origin=GROK_ORIGIN,

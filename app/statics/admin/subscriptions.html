@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title data-i18n="subs.pageTitle">Grok2API - 订阅管理</title>
+  <link rel="icon" href="/favicon.ico?v={{APP_VERSION}}">
+  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+  <style>
+    body { background: #fdf3f8 }
+    .admin-main{max-width:1280px;margin:0 auto;padding:78px 28px 40px}
+
+    .page-hd{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:20px}
+    .page-title{font-size:22px;font-weight:700;line-height:1.2}
+    .page-sub{font-size:13px;color:var(--fg-muted);margin-top:5px}
+    .page-actions{display:flex;gap:8px;align-items:center;flex-shrink:0}
+
+    /* 统计卡 */
+    .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}
+    .stat-card{
+      background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-xl);
+      padding:14px 16px;display:flex;flex-direction:column;gap:4px;
+      backdrop-filter:blur(14px) saturate(1.3);
+      transition:transform .15s, box-shadow .15s;
+    }
+    .stat-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-md)}
+    .stat-label{font-size:11px;color:var(--fg-muted);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+    .stat-value{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums}
+    .stat-value.accent{background:linear-gradient(110deg,var(--accent-deep),var(--accent-2));-webkit-background-clip:text;background-clip:text;color:transparent}
+    @media (max-width:860px){.stats-row{grid-template-columns:repeat(2,1fr)}}
+
+    /* 区块卡片 */
+    .section-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-xl);
+      backdrop-filter:blur(14px) saturate(1.3);box-shadow:var(--shadow-md);overflow:hidden;margin-bottom:20px}
+    .section-head-bar{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border);gap:10px;flex-wrap:wrap}
+    .section-head-title{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600}
+    .section-count-badge{min-width:20px;height:20px;padding:0 7px;border-radius:999px;background:var(--accent-soft);color:var(--accent-deep);font-size:11px;font-weight:600;display:inline-flex;align-items:center;justify-content:center}
+    .section-body{padding:16px 18px}
+
+    /* 添加订阅表单 */
+    .add-row{display:flex;gap:8px;flex-wrap:wrap}
+    .add-row .input{flex:1 1 260px}
+    .add-row .input.url-input{flex:2 1 340px}
+
+    /* 订阅源列表 */
+    .src-list{display:flex;flex-direction:column;gap:10px}
+    .src-item{border:1px solid var(--border);border-radius:14px;padding:12px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:rgba(255,255,255,.55)}
+    .src-main{flex:1;min-width:200px}
+    .src-name{font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px}
+    .src-url{font-size:11px;color:var(--fg-subtle);margin-top:3px;font-family:'SFMono-Regular',Consolas,monospace;word-break:break-all}
+    .src-meta{font-size:11px;color:var(--fg-muted);margin-top:3px}
+    .src-meta .ok{color:var(--success)} .src-meta .bad{color:var(--error)}
+
+    .state-dot{width:8px;height:8px;border-radius:999px;flex-shrink:0}
+    .state-ok{background:var(--success)} .state-bad{background:var(--error)} .state-off{background:#ccc}
+
+    /* 节点表 */
+    .table-wrap{overflow-x:auto}
+    table.nodes-table{width:100%;border-collapse:collapse;font-size:12px}
+    .nodes-table th{text-align:left;padding:8px 10px;color:var(--fg-muted);font-weight:600;font-size:11px;letter-spacing:.03em;border-bottom:1px solid var(--border);white-space:nowrap}
+    .nodes-table td{padding:8px 10px;border-bottom:1px solid rgba(248,220,236,.5);vertical-align:middle;white-space:nowrap}
+    .rank-chip{display:inline-flex;min-width:24px;height:20px;padding:0 6px;align-items:center;justify-content:center;border-radius:999px;font-size:11px;font-weight:700;background:var(--accent-soft);color:var(--accent-deep)}
+    .rank-chip.top{background:linear-gradient(120deg,var(--accent),var(--accent-3));color:#fff}
+    .proto-chip{display:inline-flex;padding:2px 8px;border-radius:999px;font-size:10.5px;font-weight:700;letter-spacing:.02em;background:var(--accent-2-soft);color:#3d87c7;text-transform:uppercase}
+    .lat-cell{font-variant-numeric:tabular-nums;font-weight:600}
+    .lat-fast{color:var(--success)} .lat-mid{color:#e8a23c} .lat-slow{color:var(--error)}
+    .score-bar{width:64px;height:5px;border-radius:999px;background:rgba(255,126,182,.15);overflow:hidden}
+    .score-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent-3));transition:width .4s ease}
+
+    .badge{display:inline-flex;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:600}
+    .badge-healthy{background:var(--success-bg);color:var(--success)}
+    .badge-degraded{background:#fff4e0;color:#e8a23c}
+    .badge-dead{background:var(--error-bg);color:var(--error)}
+    .badge-new{background:var(--info-bg);color:#4d9fd6}
+    .badge-needs-core{background:#f3ecff;color:#8a63e8}
+
+    .empty-state{padding:36px 20px}
+    .spin{animation:spin 1s linear infinite;display:inline-block}
+    @keyframes spin{to{transform:rotate(360deg)}}
+  </style>
+</head>
+<body>
+<div id="admin-header" data-active="/admin/subscriptions"></div>
+
+<main class="admin-main">
+  <div class="page-hd">
+    <div>
+      <div class="page-title" data-i18n="subs.title">订阅管理</div>
+      <div class="page-sub" data-i18n="subs.subtitle">机场订阅 · 节点测速 · 按账号绑定最优线路</div>
+    </div>
+    <div class="page-actions">
+      <button class="btn btn-primary" id="btn-speedtest" onclick="startSpeedtest()">
+        <span id="speedtest-label" data-i18n="subs.speedtest">一键测速</span>
+      </button>
+      <button class="btn" onclick="refreshAll()" data-i18n="subs.refreshAll">刷新全部订阅</button>
+    </div>
+  </div>
+
+  <!-- 统计 -->
+  <div class="stats-row">
+    <div class="stat-card"><span class="stat-label" data-i18n="subs.statSources">订阅源</span><span class="stat-value accent" id="st-sources">-</span></div>
+    <div class="stat-card"><span class="stat-label" data-i18n="subs.statNodes">节点总数</span><span class="stat-value" id="st-nodes">-</span></div>
+    <div class="stat-card"><span class="stat-label" data-i18n="subs.statUsable">可用节点</span><span class="stat-value" id="st-usable">-</span></div>
+    <div class="stat-card"><span class="stat-label" data-i18n="subs.statHealthy">健康节点</span><span class="stat-value" id="st-healthy">-</span></div>
+  </div>
+
+  <!-- 订阅源 -->
+  <div class="section-card">
+    <div class="section-head-bar">
+      <div class="section-head-title">
+        <span data-i18n="subs.sourcesTitle">机场订阅</span>
+        <span class="section-count-badge" id="cnt-sources">0</span>
+      </div>
+      <span style="font-size:11px;color:var(--fg-subtle)" data-i18n="subs.sourcesHint">支持 base64 节点列表与 Clash YAML，凭据不会回显</span>
+    </div>
+    <div class="section-body">
+      <div class="add-row" style="margin-bottom:14px">
+        <input class="input" id="sub-name" style="max-width:180px" data-i18n-placeholder="subs.namePlaceholder" placeholder="备注名">
+        <input class="input url-input" id="sub-url" data-i18n-placeholder="subs.urlPlaceholder" placeholder="https://example.com/api/v1/client/subscribe?token=...">
+        <button class="btn btn-primary" onclick="addSource()" data-i18n="common.add">添加</button>
+      </div>
+      <div class="src-list" id="src-list"><div class="empty-state text-muted" data-i18n="subs.noSources">暂无订阅源，添加后自动拉取节点</div></div>
+    </div>
+  </div>
+
+  <!-- 节点 -->
+  <div class="section-card">
+    <div class="section-head-bar">
+      <div class="section-head-title">
+        <span data-i18n="subs.nodesTitle">节点排行</span>
+        <span class="section-count-badge" id="cnt-nodes">0</span>
+      </div>
+      <span style="font-size:11px;color:var(--fg-subtle)" id="core-hint"></span>
+    </div>
+    <div class="section-body table-wrap">
+      <table class="nodes-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th data-i18n="subs.colName">名称</th>
+            <th data-i18n="subs.colProto">协议</th>
+            <th data-i18n="subs.colServer">服务器</th>
+            <th data-i18n="subs.colLatency">延迟</th>
+            <th data-i18n="subs.colLoss">丢包率</th>
+            <th data-i18n="subs.colScore">评分</th>
+            <th data-i18n="subs.colState">状态</th>
+          </tr>
+        </thead>
+        <tbody id="nodes-tbody">
+          <tr><td colspan="8" class="empty-state text-muted" data-i18n="subs.loading">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<script src="/static/js/i18n.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/admin-header.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/footer.js?v={{APP_VERSION}}"></script>
+<script>
+let _pollTimer = null;
+
+async function _api(method, path, body) {
+  const key = await adminKey.get();
+  const r = await fetch(ADMIN_API + path, {
+    method,
+    headers: { ...(body != null && { 'Content-Type': 'application/json' }),
+               Authorization: `Bearer ${key}` },
+    ...(body != null && { body: JSON.stringify(body) }),
+  });
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    throw new Error(d.detail || d.error?.message || r.status);
+  }
+  return r.json();
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function latClass(ms) { return ms <= 400 ? 'lat-fast' : ms <= 1200 ? 'lat-mid' : 'lat-slow'; }
+
+function stateBadge(state) {
+  const map = {healthy:['badge-healthy','healthy'],degraded:['badge-degraded','degraded'],
+               dead:['badge-dead','dead'],new:['badge-new','new'],needs_core:['badge-needs-core','needsCore']};
+  const [cls, key] = map[state] || ['badge-new','new'];
+  return `<span class="badge ${cls}">${esc(t('subs.state.'+key))}</span>`;
+}
+
+async function load() {
+  try {
+    const [subs, nodes] = await Promise.all([
+      _api('GET', '/proxy/subscriptions'),
+      _api('GET', '/proxy/nodes'),
+    ]);
+    renderStats(subs.stats);
+    renderSources(subs.sources);
+    renderNodes(nodes);
+    schedulePoll(nodes.running);
+    document.getElementById('core-hint').textContent = subs.stats.core_running
+      ? t('subs.coreRunning') : '';
+  } catch (e) { showToast(e.message || e, 'error'); }
+}
+
+function renderStats(s) {
+  if (!s) return;
+  document.getElementById('st-sources').textContent = s.source_count ?? 0;
+  document.getElementById('st-nodes').textContent = s.node_count ?? 0;
+  document.getElementById('st-usable').textContent = s.usable_count ?? 0;
+  document.getElementById('st-healthy').textContent = s.healthy_count ?? 0;
+}
+
+function renderSources(list) {
+  const wrap = document.getElementById('src-list');
+  document.getElementById('cnt-sources').textContent = list.length;
+  if (!list.length) {
+    wrap.innerHTML = `<div class="empty-state text-muted">${esc(t('subs.noSources'))}</div>`;
+    return;
+  }
+  wrap.innerHTML = list.map(src => `
+    <div class="src-item">
+      <span class="state-dot ${src.enabled ? (src.last_fetch_ok ? 'state-ok' : (src.last_fetch_at ? 'state-bad' : 'state-off')) : 'state-off'}"></span>
+      <div class="src-main">
+        <div class="src-name">${esc(src.name || src.source_id)}</div>
+        <div class="src-url">${esc(src.masked_url || src.url)}</div>
+        <div class="src-meta">${src.last_fetch_ok
+          ? `<span class="ok">✓</span> ${t('subs.nodeCount')}: ${src.node_count}`
+          : (src.last_error ? `<span class="bad">✗</span> ${esc(src.last_error)}` : t('subs.notFetched'))}</div>
+      </div>
+      <button class="btn" onclick="toggleSource('${esc(src.source_id)}', ${!src.enabled})">${src.enabled ? t('subs.disable') : t('subs.enable')}</button>
+      <button class="btn" onclick="refreshOne('${esc(src.source_id)}')">${t('subs.refresh')}</button>
+      <button class="btn" onclick="delSource('${esc(src.source_id)}')" style="color:var(--error)">${t('common.delete')}</button>
+    </div>`).join('');
+}
+
+function renderNodes(data) {
+  const tbody = document.getElementById('nodes-tbody');
+  const list = data.nodes || [];
+  document.getElementById('cnt-nodes').textContent = list.length;
+  const label = document.getElementById('speedtest-label');
+  if (data.running) {
+    label.innerHTML = `<span class="spin">✦</span> ${esc(t('subs.testing'))}`;
+  } else {
+    label.textContent = t('subs.speedtest');
+  }
+  if (!list.length) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-state text-muted">${esc(t('subs.noNodes'))}</td></tr>`;
+    return;
+  }
+  const maxScore = Math.max(...list.map(n => n.score || 0), 1);
+  tbody.innerHTML = list.map(n => {
+    const rankCls = n.rank <= 3 ? 'top' : '';
+    const lat = n.latency_ms != null ? `${Math.round(n.latency_ms)} ms` : '—';
+    const lossPct = Math.round((n.loss_rate || 0) * 100);
+    const scorePct = Math.min(100, Math.round(((n.score || 0) / maxScore) * 100));
+    return `<tr>
+      <td><span class="rank-chip ${rankCls}">${n.rank}</span></td>
+      <td style="font-weight:600">${esc(n.name || n.node_id)}</td>
+      <td><span class="proto-chip">${esc(n.protocol)}</span></td>
+      <td style="font-family:Consolas,monospace;font-size:11px">${esc(n.server_masked)}:${n.port}</td>
+      <td class="lat-cell ${n.latency_ms != null ? latClass(n.latency_ms) : ''}">${lat}</td>
+      <td class="lat-cell ${lossPct >= 30 ? 'lat-slow' : ''}">${lossPct}%</td>
+      <td><div class="score-bar"><div class="score-fill" style="width:${scorePct}%"></div></div></td>
+      <td>${stateBadge(n.state)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function schedulePoll(running) {
+  if (running && !_pollTimer) {
+    _pollTimer = setInterval(async () => {
+      try {
+        const nodes = await _api('GET', '/proxy/nodes');
+        renderNodes(nodes);
+        if (!nodes.running) { stopPoll(); load(); }
+      } catch { stopPoll(); }
+    }, 2500);
+  } else if (!running) stopPoll();
+}
+function stopPoll() { if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; } }
+
+async function addSource() {
+  const urlEl = document.getElementById('sub-url');
+  const nameEl = document.getElementById('sub-name');
+  const url = urlEl.value.trim();
+  if (!url) return showToast(t('subs.needUrl'), 'info');
+  try {
+    const res = await _api('POST', '/proxy/subscriptions', { name: nameEl.value.trim(), url });
+    if (res.fetch?.ok) showToast(`${t('subs.added')} · ${res.fetch.node_count} ${t('subs.nodesUnit')}`, 'success');
+    else showToast(res.fetch?.error || t('subs.fetchFailed'), 'error');
+    urlEl.value = ''; nameEl.value = '';
+    load();
+  } catch (e) { showToast(e.message || e, 'error'); }
+}
+
+async function delSource(id) {
+  if (!confirm(t('subs.confirmDelete'))) return;
+  try { await _api('DELETE', `/proxy/subscriptions/${id}`); showToast(t('common.deleted'), 'success'); load(); }
+  catch (e) { showToast(e.message || e, 'error'); }
+}
+
+async function toggleSource(id, enabled) {
+  try { await _api('PATCH', `/proxy/subscriptions/${id}`, { enabled }); load(); }
+  catch (e) { showToast(e.message || e, 'error'); }
+}
+
+async function refreshOne(id) {
+  try {
+    // 单个刷新 = 全部刷新里过滤该源结果；轻量实现直接全刷（源数量通常很少）
+    await _api('POST', '/proxy/subscriptions/refresh');
+    showToast(t('subs.refreshed'), 'success'); load();
+  } catch (e) { showToast(e.message || e, 'error'); }
+}
+
+async function refreshAll() {
+  try {
+    showToast(t('subs.refreshing'), 'info');
+    await _api('POST', '/proxy/subscriptions/refresh');
+    showToast(t('subs.refreshed'), 'success'); load();
+  } catch (e) { showToast(e.message || e, 'error'); }
+}
+
+async function startSpeedtest() {
+  try {
+    const res = await _api('POST', '/proxy/nodes/speedtest');
+    if (res.status === 'already_running') return showToast(t('subs.alreadyTesting'), 'info');
+    showToast(t('subs.testStarted'), 'success');
+    schedulePoll(true);
+  } catch (e) { showToast(e.message || e, 'error'); }
+}
+
+(async () => {
+  await waitI18n?.();
+  await renderAdminHeader?.();
+  await renderSiteFooter?.();
+  const key = await adminKey.get();
+  if (!key || !await verifyKey(ADMIN_API + '/verify', key).catch(() => false))
+    return location.href = '/admin/login';
+  load();
+})();
+</script>
+</body>
+</html>

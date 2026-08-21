@@ -79,22 +79,32 @@ def browser_from_user_agent(user_agent: str) -> str:
 def resolve_proxy_profile(lease: ProxyLease | None) -> ProxyProfile:
     """Resolve cookies, UA, clearance and curl_cffi browser from one source order.
 
-    Flat legacy keys win over the nested v2 clearance keys because external
-    refresher sidecars write the flat values at runtime.  The resolved browser
-    is derived from the effective User-Agent first, keeping header UA,
-    client-hints and curl_cffi impersonation aligned.
+    Priority: per-account stable fingerprint (when enabled and seeded) →
+    lease-carried values → flat legacy config keys → nested v2 clearance keys.
+    The resolved browser is derived from the effective User-Agent, keeping
+    header UA, client-hints and curl_cffi impersonation aligned.
     """
     cfg = resolve_clearance_config()
 
+    user_agent = ""
+    if (
+        lease is not None
+        and lease.fingerprint_seed
+        and _per_account_fingerprint_enabled()
+    ):
+        from app.control.proxy.fingerprint import stable_user_agent
+
+        user_agent = stable_user_agent(lease.fingerprint_seed)
+
     if lease is not None:
         cookies = lease.cf_cookies or cfg.cf_cookies
-        user_agent = lease.user_agent or cfg.user_agent
+        user_agent = user_agent or lease.user_agent or cfg.user_agent
         clearance = (
             extract_cookie_value(lease.cf_cookies, "cf_clearance") or cfg.cf_clearance
         )
     else:
         cookies = cfg.cf_cookies
-        user_agent = cfg.user_agent
+        user_agent = user_agent or cfg.user_agent
         clearance = cfg.cf_clearance
 
     browser = (
@@ -109,6 +119,15 @@ def resolve_proxy_profile(lease: ProxyLease | None) -> ProxyProfile:
         cf_clearance=clearance,
         browser=browser,
     )
+
+
+def _per_account_fingerprint_enabled() -> bool:
+    try:
+        from app.platform.config.snapshot import get_config
+
+        return get_config().get_bool("features.per_account_fingerprint", True)
+    except Exception:  # noqa: BLE001 — config not ready yet → default on
+        return True
 
 
 __all__ = [

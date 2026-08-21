@@ -6,6 +6,7 @@ configuration loading and clearance refresh lifecycle.
 """
 
 import asyncio
+import hashlib
 from urllib.parse import urlparse
 
 from app.platform.logging.logger import logger
@@ -90,6 +91,16 @@ class ProxyDirectory:
             cfg.get_int("proxy.clearance.timeout_sec", 60),
         )
 
+        # Bootstrap the subscription manager when entering subscription mode so
+        # the first acquire() already has ranked nodes available.
+        if egress_mode == EgressMode.SUBSCRIPTION:
+            from .subscription import get_subscription_manager
+
+            manager = get_subscription_manager()
+            if not getattr(manager, "_bootstrapped", False):
+                manager._bootstrapped = True  # noqa: SLF001 — same-package bootstrap flag
+                await manager.startup()
+
         nodes: list[EgressNode] = []
         resource_nodes: list[EgressNode] = []
 
@@ -154,12 +165,17 @@ class ProxyDirectory:
         kind: RequestKind = RequestKind.HTTP,
         resource: bool = False,
         clearance_origin: str | None = None,
+        affinity_key: str | None = None,
     ) -> ProxyLease:
         """Return a ProxyLease for the next request.
 
         For DIRECT mode, returns a lease with no proxy or clearance.
+        In SUBSCRIPTION mode, *affinity_key* (typically the account token)
+        binds the lease to that account's best-speed egress node.
         """
-        proxy_url = await self._pick_proxy_url(resource=resource)
+        proxy_url = await self._pick_proxy_url(
+            resource=resource, affinity_key=affinity_key
+        )
         affinity = proxy_url or "direct"
         clearance_host = _clearance_host(clearance_origin)
 
@@ -178,6 +194,7 @@ class ProxyDirectory:
             scope=scope,
             kind=kind,
             acquired_at=now_ms(),
+            fingerprint_seed=affinity_key or "",
         )
 
     async def feedback(self, lease: ProxyLease, result: ProxyFeedback) -> None:
@@ -197,19 +214,34 @@ class ProxyDirectory:
                         update={"state": ClearanceBundleState.INVALID}
                     )
 
+        failed = result.kind in (
+            ProxyFeedbackKind.CHALLENGE,
+            ProxyFeedbackKind.UNAUTHORIZED,
+            ProxyFeedbackKind.FORBIDDEN,
+            ProxyFeedbackKind.TRANSPORT_ERROR,
+        )
+
+        # SUBSCRIPTION mode: propagate failures onto the bound node so the
+        # speed-test EWMA demotes it and accounts re-bind away from it.
+        if self._egress_mode == EgressMode.SUBSCRIPTION and lease.proxy_url:
+            from .subscription import get_subscription_manager
+            from .subscription.speedtest import NodeSpeedTester
+
+            node = get_subscription_manager().node_by_egress(lease.proxy_url)
+            if node is not None:
+                if failed:
+                    NodeSpeedTester()._apply_failure(node)  # noqa: SLF001
+                elif result.kind == ProxyFeedbackKind.SUCCESS:
+                    node.fail_count = 0
+                    node.ok_count += 1
+
         # In PROXY_POOL mode, rotate to the next node on any failure so the
         # next acquire() prefers a different egress rather than hammering the
         # same broken node.
         if (
             self._egress_mode == EgressMode.PROXY_POOL
             and lease.proxy_url
-            and result.kind
-            in (
-                ProxyFeedbackKind.CHALLENGE,
-                ProxyFeedbackKind.UNAUTHORIZED,
-                ProxyFeedbackKind.FORBIDDEN,
-                ProxyFeedbackKind.TRANSPORT_ERROR,
-            )
+            and failed
         ):
             async with self._lock:
                 self._pool_cursor += 1
@@ -224,9 +256,16 @@ class ProxyDirectory:
     # Internal
     # ------------------------------------------------------------------
 
-    async def _pick_proxy_url(self, resource: bool = False) -> str | None:
+    async def _pick_proxy_url(
+        self, resource: bool = False, affinity_key: str | None = None
+    ) -> str | None:
         if self._egress_mode == EgressMode.DIRECT:
             return None
+        if self._egress_mode == EgressMode.SUBSCRIPTION:
+            from .subscription import get_subscription_manager
+
+            node = get_subscription_manager().pick_for_account(affinity_key)
+            return node.egress_url if node else None
         async with self._lock:
             # Prefer resource-specific nodes when available; fall back to base nodes.
             nodes = (
@@ -238,8 +277,15 @@ class ProxyDirectory:
                 return None
             if self._egress_mode == EgressMode.SINGLE_PROXY:
                 return nodes[0].proxy_url
-            # PROXY_POOL: sticky routing — use current cursor, rotate on failure.
-            idx = self._pool_cursor % len(nodes)
+            # PROXY_POOL: per-account sticky member — the same account always
+            # maps to the same pool entry (anti-correlation: no IP hopping).
+            # Anonymous/system calls without an identity fall back to cursor
+            # rotation for even load spreading.
+            if affinity_key:
+                digest = hashlib.sha1(affinity_key.encode("utf-8")).digest()
+                idx = int.from_bytes(digest[:4], "big") % len(nodes)
+            else:
+                idx = self._pool_cursor % len(nodes)
             return nodes[idx].proxy_url
 
     async def _get_or_build_bundle(

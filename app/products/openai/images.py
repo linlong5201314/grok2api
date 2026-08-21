@@ -900,7 +900,7 @@ async def _stream_image_edit(
     timeout_s: float = 120.0,
 ) -> AsyncGenerator[str, None]:
     proxy = await get_proxy_runtime()
-    lease = await proxy.acquire()
+    lease = await proxy.acquire(affinity_key=token)
     payload = build_image_edit_payload(
         prompt=prompt,
         image_references=image_references,
@@ -941,7 +941,7 @@ async def _stream_lite_generate(
     timeout_s: float = 120.0,
 ) -> AsyncGenerator[str, None]:
     proxy   = await get_proxy_runtime()
-    lease   = await proxy.acquire()
+    lease   = await proxy.acquire(affinity_key=token)
     payload = build_chat_payload(
         message           = f"Drawing: {message}",
         mode_id           = mode_id,

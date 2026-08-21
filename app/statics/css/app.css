@@ -1126,3 +1126,152 @@ textarea.input.webui-textarea{padding:8px 0 !important;resize:none !important}
 .cb{width:14px;height:14px;accent-color:var(--fg);cursor:pointer}
 .action-btns{display:flex;gap:4px}
 .empty-state{text-align:center;padding:40px;color:var(--fg-muted);font-size:13px}
+
+/* ==========================================================================
+   Anime Fresh Theme Layer — 樱花主题（附加层，覆盖上方 Geist 极简基调）
+   纯 CSS 实现：渐变背景 + 飘落花瓣 + 玻璃拟态卡片 + 渐变按钮
+   ========================================================================== */
+
+:root {
+  --bg:#fdf3f8;
+  --bg-card:rgba(255,255,255,.86);
+  --fg:#402a44;
+  --fg-muted:#96799f;
+  --fg-subtle:#c4abd0;
+  --border:#f8dcec;
+  --accent:#ff7eb6;
+  --accent-deep:#e85d9f;
+  --accent-soft:#ffe1ef;
+  --accent-2:#7cc7ff;
+  --accent-2-soft:#e3f2ff;
+  --accent-3:#b595ff;
+  --success:#2fbf8f; --success-bg:#e2faf1;
+  --error:#ff6482;  --error-bg:#ffe9ee;
+  --info:#7cc7ff;   --info-bg:#e9f5ff;
+  --radius:10px;
+  --radius-xl:18px;
+  --shadow-md:0 6px 22px rgba(255,126,182,.14);
+  --shadow-lg:0 24px 60px rgba(232,93,159,.18);
+}
+
+/* ---------- 动态渐变背景 + 樱花飘落 ---------- */
+body{
+  background:linear-gradient(135deg,#fdf3f8 0%,#f3f6ff 38%,#fdf3f8 70%,#fff7fb 100%) !important;
+  background-attachment:fixed !important;
+}
+body::before{
+  content:"";position:fixed;inset:-10%;z-index:-2;pointer-events:none;
+  background:
+    radial-gradient(42rem 42rem at 12% 8%, rgba(255,183,213,.30), transparent 62%),
+    radial-gradient(38rem 38rem at 88% 16%, rgba(158,214,255,.28), transparent 60%),
+    radial-gradient(46rem 46rem at 78% 88%, rgba(196,168,255,.22), transparent 64%),
+    radial-gradient(34rem 34rem at 18% 86%, rgba(255,214,232,.30), transparent 60%);
+  animation:sakuraDrift 26s ease-in-out infinite alternate;
+}
+@keyframes sakuraDrift{
+  0%{transform:translate3d(0,0,0) scale(1)}
+  50%{transform:translate3d(-1.6%,1.2%,0) scale(1.04)}
+  100%{transform:translate3d(1.4%,-1.2%,0) scale(1.02)}
+}
+/* 花瓣：两层伪元素各带一组 box-shadow 花瓣点，飘落+旋转 */
+body::after{
+  content:"";position:fixed;top:-6%;left:0;right:0;height:112%;z-index:-1;
+  pointer-events:none;opacity:.75;
+  background-image:
+    radial-gradient(6px 5px at 8% 12%,  #ffc7de 42%, transparent 46%),
+    radial-gradient(5px 4px at 22% 58%, #ffd9ea 42%, transparent 46%),
+    radial-gradient(6px 5px at 36% 30%, #ffb1d2 42%, transparent 46%),
+    radial-gradient(5px 4px at 52% 74%, #ffd9ea 42%, transparent 46%),
+    radial-gradient(6px 5px at 66% 20%, #ffcfe3 42%, transparent 46%),
+    radial-gradient(5px 4px at 80% 52%, #ffb1d2 42%, transparent 46%),
+    radial-gradient(6px 5px at 92% 78%, #ffd9ea 42%, transparent 46%);
+  animation:petalFall 19s linear infinite;
+}
+@keyframes petalFall{
+  0%{transform:translateY(-4%) rotate(0deg)}
+  100%{transform:translateY(9%) rotate(320deg)}
+}
+@media (prefers-reduced-motion:reduce){
+  body::before,body::after{animation:none}
+}
+
+/* ---------- 卡片玻璃拟态 ---------- */
+.login-card,.admin-card,.card,.stat-card,.section-card,.modal-content,.toast{
+  background:var(--bg-card) !important;
+  backdrop-filter:blur(14px) saturate(1.35);
+  -webkit-backdrop-filter:blur(14px) saturate(1.35);
+  border:1px solid rgba(255,182,213,.45) !important;
+  box-shadow:var(--shadow-md) !important;
+}
+.login-card:hover{border-color:var(--accent) !important}
+
+/* ---------- 按钮：渐变主色 ---------- */
+.btn-primary{
+  background:linear-gradient(120deg,var(--accent) 0%,var(--accent-3) 55%,var(--accent-2) 110%) !important;
+  color:#fff !important;border:none !important;
+  box-shadow:0 4px 14px rgba(255,126,182,.35);
+  transition:filter .15s, transform .15s, box-shadow .15s;
+}
+.btn-primary:hover{filter:brightness(1.06);transform:translateY(-1px);box-shadow:0 6px 18px rgba(255,126,182,.45)}
+.btn-primary:active{transform:translateY(0)}
+.btn:not(.btn-primary):hover{background:var(--accent-soft)}
+
+/* ---------- 输入框聚焦光晕 ---------- */
+.input:focus,textarea.input:focus,select.input:focus{
+  border-color:var(--accent) !important;
+  box-shadow:0 0 0 3px rgba(255,126,182,.16) !important;
+}
+
+/* ---------- 顶栏 ---------- */
+.admin-header,.webui-header-bar{
+  background:rgba(253,243,248,.82) !important;
+  backdrop-filter:blur(12px) saturate(1.3);
+  -webkit-backdrop-filter:blur(12px) saturate(1.3);
+  border-bottom:1px solid rgba(255,182,213,.4);
+}
+.admin-brand{
+  background:linear-gradient(110deg,var(--accent-deep),var(--accent-3) 60%,var(--accent-2));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.admin-nav-link{position:relative;border-radius:999px;transition:color .15s,background .15s}
+.admin-nav-link:hover{color:var(--accent-deep);background:var(--accent-soft)}
+.admin-nav-link.active{
+  color:#fff;font-weight:600;
+  background:linear-gradient(120deg,var(--accent),var(--accent-3));
+  box-shadow:0 3px 10px rgba(255,126,182,.35);
+}
+.admin-header-version{background:var(--accent-soft);color:var(--accent-deep)}
+.admin-header-version.has-update::after{background:var(--accent-2)}
+.admin-header-control:hover{background:var(--accent-soft);color:var(--accent-deep)}
+
+/* ---------- 徽标 / 标签 / 分页 ---------- */
+.badge,.pill,.tag,[class*="-badge"]{border-radius:999px}
+.page-btn.active{
+  background:linear-gradient(120deg,var(--accent),var(--accent-3)) !important;
+  color:#fff !important;border-color:transparent !important;
+}
+.cb{accent-color:var(--accent)}
+
+/* ---------- 滚动条 ---------- */
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{
+  background:linear-gradient(var(--accent-soft),#fbc7de);
+  border-radius:999px;border:2px solid transparent;background-clip:padding-box;
+}
+::-webkit-scrollbar-thumb:hover{background:var(--accent);border:2px solid transparent;background-clip:padding-box}
+
+/* ---------- 表格行悬停 ---------- */
+tbody tr{transition:background .12s}
+tbody tr:hover{background:rgba(255,225,239,.35)}
+
+/* ---------- Toast 彩色描边 ---------- */
+.toast-success{border-color:rgba(47,191,143,.5) !important}
+.toast-error{border-color:rgba(255,100,130,.5) !important}
+.toast-info{border-color:rgba(124,199,255,.55) !important}
+
+/* ---------- 登录页品牌渐变字 ---------- */
+.login-title{
+  background:linear-gradient(110deg,var(--accent-deep),var(--accent-3) 55%,var(--accent-2));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}

@@ -198,7 +198,7 @@ def test_required_stream():
     fc_added = [e for e in events if e["event"] == "response.output_item.added"
                 and e["data"].get("item", {}).get("type") == "function_call"]
     if fc_added:
-        ok(f"response.output_item.added (function_call) received")
+        ok("response.output_item.added (function_call) received")
         fc_item = fc_added[0]["data"]["item"]
         fc_item_id = fc_item.get("id", "")
 

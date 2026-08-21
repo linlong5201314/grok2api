@@ -33,7 +33,8 @@
     "versionUnavailable": "Failed to check for updates.",
     "versionNotesEmpty": "No release notes available.",
     "versionOpenRelease": "Open Release",
-    "versionClose": "Close"
+    "versionClose": "Close",
+    "subscriptions": "Subscriptions"
   },
   "webui": {
     "header": {
@@ -353,7 +354,8 @@
         "timeouts": "Request Timeouts",
         "imageProtocol": "NSFW and Image Streaming",
         "logging": "Logging",
-        "localMediaCache": "Local Media Cache"
+        "localMediaCache": "Local Media Cache",
+        "subscription": "Airport Subscription"
       },
       "options": {
         "imageFormat": {
@@ -372,7 +374,8 @@
         "proxyMode": {
           "direct": "Direct",
           "singleProxy": "Fixed Proxy",
-          "proxyPool": "Proxy Pool"
+          "proxyPool": "Proxy Pool",
+          "subscription": "Subscription"
         },
         "clearanceMode": {
           "none": "Disabled",
@@ -625,6 +628,30 @@
         "logMaxFiles": {
           "label": "Log Retention (days)",
           "desc": "Maximum number of daily log files to keep during rotation. Default: 7."
+        },
+        "subUrls": {
+          "label": "Subscription URLs",
+          "desc": "One airport subscription URL per line; can also be managed on the Subscriptions page. Trigger a refresh after changing."
+        },
+        "subRefresh": {
+          "label": "Refresh interval (sec)",
+          "desc": "How often to re-fetch subscriptions, minimum 300."
+        },
+        "subSpeedtest": {
+          "label": "Speed-test interval (sec)",
+          "desc": "Background probe cycle, minimum 120; scores drive routing and per-account binding."
+        },
+        "subAffinity": {
+          "label": "Affinity spread",
+          "desc": "Each account binds one stable egress IP among the top-N scored nodes to avoid IP-hopping flags."
+        },
+        "subMaxNodes": {
+          "label": "Max routing nodes",
+          "desc": "Only the top-N scored nodes participate in egress selection."
+        },
+        "subCorePath": {
+          "label": "sing-box path (optional)",
+          "desc": "When set, vmess/vless/trojan/ss/hysteria2 nodes egress via local sing-box; empty allows direct protocols only."
         }
       }
     }
@@ -699,5 +726,54 @@
     "startFailed": "Failed to start: {message}",
     "cancelInProgress": "Cancellation requested. Wait for the current batch to finish.",
     "na": "—"
+  },
+  "subs": {
+    "pageTitle": "Grok2API - Subscriptions",
+    "title": "Subscriptions",
+    "subtitle": "Airport feeds · node speed tests · per-account best-route binding",
+    "speedtest": "Speed Test",
+    "refreshAll": "Refresh All",
+    "statSources": "Sources",
+    "statNodes": "Nodes",
+    "statUsable": "Usable",
+    "statHealthy": "Healthy",
+    "sourcesTitle": "Airport Feeds",
+    "sourcesHint": "base64 link lists & Clash YAML supported; secrets never echoed",
+    "namePlaceholder": "Name",
+    "urlPlaceholder": "https://example.com/api/v1/client/subscribe?token=...",
+    "noSources": "No sources yet — add one to fetch nodes",
+    "nodesTitle": "Node Ranking",
+    "loading": "Loading…",
+    "noNodes": "No nodes yet — add a source first",
+    "colName": "Name",
+    "colProto": "Proto",
+    "colServer": "Server",
+    "colLatency": "Latency",
+    "colLoss": "Loss",
+    "colScore": "Score",
+    "colState": "State",
+    "needUrl": "Subscription URL is required",
+    "added": "Source added",
+    "fetchFailed": "Fetch failed, check the URL",
+    "confirmDelete": "Delete this source and its nodes?",
+    "refreshing": "Refreshing…",
+    "refreshed": "Sources refreshed",
+    "testStarted": "Speed test started",
+    "alreadyTesting": "A test is already running",
+    "testing": "Testing…",
+    "notFetched": "Not fetched yet",
+    "nodeCount": "Nodes",
+    "nodesUnit": "nodes",
+    "coreRunning": "sing-box core running: vmess/vless/trojan/ss egress via local ports",
+    "enable": "Enable",
+    "disable": "Disable",
+    "refresh": "Refresh",
+    "state": {
+      "healthy": "Healthy",
+      "degraded": "Degraded",
+      "dead": "Dead",
+      "new": "New",
+      "needsCore": "Needs Core"
+    }
   }
 }

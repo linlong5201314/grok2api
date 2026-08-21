@@ -221,6 +221,46 @@ def build_sso_cookie(
     return cookie
 
 
+def _accept_language(lease: ProxyLease | None) -> str:
+    """Per-account stable Accept-Language when fingerprinting is seeded."""
+    if lease is not None and lease.fingerprint_seed:
+        from app.control.proxy.fingerprint import stable_accept_language
+
+        return stable_accept_language(lease.fingerprint_seed)
+    try:
+        from app.platform.config.snapshot import get_config
+
+        cfg_lang = get_config().get_str("proxy.fingerprint.accept_language", "")
+        if cfg_lang:
+            return cfg_lang
+    except Exception:  # noqa: BLE001
+        pass
+    return "en-US,en;q=0.9"
+
+
+def _sentry_baggage() -> str:
+    """Baggage header; release hash configurable to track upstream deploys."""
+    release = "d6add6fb0460641fd482d767a335ef72b9b6abb8"
+    public_key = "b311e0f2690c81f25e2c4cf6d4f7ce1c"
+    try:
+        from app.platform.config.snapshot import get_config
+
+        release = (
+            get_config().get_str("proxy.fingerprint.sentry_release", "") or release
+        )
+        public_key = (
+            get_config().get_str("proxy.fingerprint.sentry_public_key", "")
+            or public_key
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return (
+        "sentry-environment=production,"
+        f"sentry-release={release},"
+        f"sentry-public_key={public_key}"
+    )
+
+
 def build_http_headers(
     cookie_token: str,
     *,
@@ -258,12 +298,8 @@ def build_http_headers(
     headers: dict[str, str] = {
         "Accept": accept,
         "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Baggage": (
-            "sentry-environment=production,"
-            "sentry-release=d6add6fb0460641fd482d767a335ef72b9b6abb8,"
-            "sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c"
-        ),
+        "Accept-Language": _accept_language(lease),
+        "Baggage": _sentry_baggage(),
         "Content-Type": ct,
         "Origin": org,
         "Priority": "u=1, i",
@@ -297,7 +333,7 @@ def build_ws_headers(
     org = _sanitize(origin or "https://grok.com", field="origin")
 
     headers: dict[str, str] = {
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Language": _accept_language(lease),
         "Cache-Control": "no-cache",
         "Origin": org,
         "Pragma": "no-cache",

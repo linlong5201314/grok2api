@@ -2,34 +2,42 @@
 
 [![Python](https://img.shields.io/badge/python-3.13%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.119%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Version](https://img.shields.io/badge/version-2.0.4.rc4-111827)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-2.1.0-111827)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-16a34a)](LICENSE)
 [![English](https://img.shields.io/badge/English-2563EB?logo=bookstack&logoColor=white)](docs/README.en.md)
-[![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/chenyme/grok2api)
-[![项目文档](https://img.shields.io/badge/项目文档-0F766E?logo=readthedocs&logoColor=white)](https://blog.cheny.me/blog/posts/grok2api)
-
-
-> [!IMPORTANT]
-> **项目停更公告**  
-> 因个人精力有限，且官方风控关注等多方因素影响，本 Grok2API 项目已正式停更。好消息是 x-statsig-id 仍可以通过其他手段获取/破解，仓库代码将归档并仅作学习与研究参考，后续不再进行功能开发、问题修复与技术支持。感谢各位一路以来的关注与支持！
-
-> [!TIP]
-> **个人新项目**  
-> 顺便推荐我的新项目 [DEEIX-AI：DEEIX-Chat 轻量化 AI 平台](https://github.com/DEEIX-AI/DEEIX-Chat)：企业级模型路由、对话、文件、工具、计费、身份和运维的一体化 AI 平台，全面且极致的低占用，空载运行时仅占用 34 MB。
 
 > [!NOTE]
-> 本项目仅供学习与研究交流。请务必遵循 Grok 的使用条款及当地法律法规，不得用于非法用途！
+> 本项目基于 [chenyme/grok2api](https://github.com/chenyme/grok2api) 深度改造，仅供学习与研究交流。请务必遵循 Grok 的使用条款及当地法律法规，不得用于非法用途！
 
 <br>
 
 Grok2API 是一个基于 **FastAPI** 构建的 Grok 网关，支持将 Grok Web 能力以 OpenAI 兼容 API 的方式转换。核心特性：
+
+### 网关能力
 - OpenAI 兼容接口：`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/images/generations`、`/v1/images/edits`、`/v1/videos`、`/v1/videos/{video_id}`、`/v1/videos/{video_id}/content`
 - Anthropic 兼容接口：`/v1/messages`
 - 支持流式与非流式对话、显式思考输出、函数工具结构透传，以及统一的 token / usage 统计
 - 支持多账号池、层级选号、失败反馈、额度同步与自动维护
 - 支持本地缓存图片、视频与本地代理链接返回
 - 支持文生图、图像编辑、文生视频、图生视频
-- 内置 Admin 后台管理、Web Chat、Masonry 生图、ChatKit 语音页面
+
+### 🌸 订阅代理（本版本新增）
+- **机场订阅接入**：支持 base64 节点列表与 Clash YAML 两种订阅格式，覆盖 `ss` / `vmess` / `vless` / `trojan` / `hysteria2` / `socks` / `http(s)` 协议
+- **自动测速排序**：后台周期探测节点 TCP + HTTP TTFB 延迟，EWMA 评分动态排序，故障节点自动降权摘除
+- **账号粘性绑定**：每个账号在评分前 N 的节点中稳定绑定一个出口 IP——同号不跳 IP（防风控关联），异号指纹互不相同
+- **可选 sing-box 核心**：配置 core 路径后，vmess/vless/trojan/ss/hysteria2 自动经本地 mixed 端口出站；无 core 时直连协议照常可用
+- 订阅管理页：可视化增删订阅、一键测速、实时查看节点排行与健康度
+
+### 🔒 防识别加固（本版本新增）
+- **每账号稳定指纹**：UA / Accept-Language 由账号令牌确定性派生，且严格对齐 curl_cffi 可模拟的浏览器版本（UA 与 TLS 指纹一致），同账号恒定同一"设备"
+- **可配置上游指纹**：Sentry Baggage release 哈希可在后台随上游发布更新，避免陈旧静态指纹
+- 登录防爆破：管理面板 / WebUI 连续失败 5 次锁定 15 分钟
+- 安全响应头：面板与 API 全链路 `nosniff` / `DENY` / `no-referrer` / `no-store`
+
+### 🎨 动漫清新风控制面板（本版本重制）
+- 樱花渐变背景 + 飘落花瓣动画（纯 CSS，`prefers-reduced-motion` 友好）
+- 玻璃拟态卡片、渐变按钮、柔和粉彩配色
+- 新增「订阅管理」页面；全部页面支持 6 语言切换
 
 <br>
 
@@ -142,6 +150,7 @@ docker compose up -d
 | :-- | :-- |
 | Admin 登录页 | `/admin/login` |
 | 账号管理 | `/admin/account` |
+| 订阅管理 | `/admin/subscriptions` |
 | 配置管理 | `/admin/config` |
 | 缓存管理 | `/admin/cache` |
 | WebUI 登录页 | `/webui/login` |
@@ -154,8 +163,60 @@ docker compose up -d
 | 范围 | 配置项 | 规则 |
 | :-- | :-- | :-- |
 | `/v1/*` | `app.api_key` | 为空则不额外鉴权 |
-| `/admin/*` | `app.app_key` | 默认值 `grok2api` |
+| `/admin/*` | `app.app_key` | 默认值 `grok2api`；连续失败 5 次锁定 15 分钟 |
 | `/webui/*` | `app.webui_enabled`, `app.webui_key` | 默认关闭；`webui_key` 为空则不额外校验 |
+
+<br>
+
+## 订阅代理指南 🌸
+
+### 快速上手
+
+1. **后台添加订阅**：登录 `/admin/subscriptions` → 粘贴机场订阅链接 → 添加。系统立即拉取并解析节点。
+2. **切换出口模式**：`/admin/config` → 代理模式选「机场订阅」→ 保存。或直接编辑 `${DATA_DIR}/config.toml`：
+   ```toml
+   [proxy.egress]
+   mode = "subscription"
+   ```
+3. **触发测速**：订阅页点「一键测速」。之后后台按 `speedtest_interval_sec` 周期自动测速。
+4. 完成。所有 Grok 上游流量将经由评分最优的节点出站，每个账号稳定绑定其中一条线路。
+
+### 工作原理
+
+```
+订阅链接 ──拉取──▶ 解析(base64/Clash YAML) ──▶ 节点注册表
+                                                  │
+                                    ┌─────────────┴─────────────┐
+                                    ▼                           ▼
+                            直连协议(http/socks)        核心协议(vmess/vless/…)
+                            直接作为出站代理            经本地 sing-box 出站(可选)
+                                    │                           │
+                                    └─────────┬─────────────────┘
+                                              ▼
+                              测速(TCP+HTTP TTFB) → EWMA 评分排序
+                                              ▼
+                     账号令牌哈希 ──稳定映射──▶ 前 N 名节点之一（粘性绑定）
+```
+
+- **粘性绑定**：`affinity_spread = 3` 表示每个账号在评分前 3 的节点中按账号哈希固定选择一个。节点失效时自动换绑到次优，恢复后不回跳（避免抖动）。
+- **协议支持**：`http` / `https` / `socks4` / `socks5` 可直接出站；`ss` / `vmess` / `vless` / `trojan` / `hysteria2` 需配置 sing-box（`proxy.subscription.core_path`），系统会为每个节点生成本地 mixed 入站端口。
+
+### 关键配置
+
+```toml
+[proxy.subscription]
+urls = []                          # 订阅链接（也可后台页面管理）
+refresh_interval_sec = 3600        # 订阅刷新周期
+speedtest_interval_sec = 1800      # 自动测速周期
+affinity_spread = 3                # 账号粘性候选节点数（前 N）
+max_nodes = 64                     # 参与选路的节点上限
+core_path = ""                     # sing-box 可执行文件路径（可选）
+core_start_port = 21001            # 本地核心入站起始端口
+fetch_user_agent = "ClashMetaForAndroid/2.11.5.Meta"
+```
+
+> [!TIP]
+> 订阅凭据与节点地址在面板中全部脱敏显示（服务器打码、凭据不回显），日志同样不会输出完整订阅内容。
 
 <br>
 
@@ -205,9 +266,11 @@ docker compose up -d
 | :-- | :-- |
 | `app` | `app_key`, `app_url`, `api_key`, `webui_enabled`, `webui_key` |
 | `logging` | `file_level`, `max_files` |
-| `features` | `temporary`, `memory`, `stream`, `thinking`, `auto_chat_mode_fallback`, `thinking_summary`, `dynamic_statsig`, `enable_nsfw`, `show_search_sources`, `custom_instruction`, `image_format`, `imagine_public_image_proxy`, `video_format` |
-| `proxy.egress` | `mode`, `proxy_url`, `proxy_pool`, `resource_proxy_url`, `resource_proxy_pool`, `skip_ssl_verify` |
+| `features` | `temporary`, `memory`, `stream`, `thinking`, `auto_chat_mode_fallback`, `thinking_summary`, `dynamic_statsig`, `per_account_fingerprint`, `enable_nsfw`, `show_search_sources`, `custom_instruction`, `image_format`, `imagine_public_image_proxy`, `video_format` |
+| `proxy.egress` | `mode`（direct/single_proxy/proxy_pool/subscription）, `proxy_url`, `proxy_pool`, `resource_proxy_url`, `resource_proxy_pool`, `skip_ssl_verify` |
+| `proxy.subscription` | `urls`, `refresh_interval_sec`, `speedtest_interval_sec`, `speedtest_timeout_sec`, `speedtest_concurrency`, `max_nodes`, `affinity_spread`, `fetch_user_agent`, `core_path`, `core_start_port`, `probe_url` |
 | `proxy.clearance` | `mode`, `cf_cookies`, `user_agent`, `browser`, `flaresolverr_url`, `timeout_sec`, `refresh_interval` |
+| `proxy.fingerprint` | `sentry_release`, `sentry_public_key`, `accept_language` |
 | `retry` | `reset_session_status_codes`, `max_retries`, `on_codes` |
 | `account.refresh` | `basic_interval_sec`, `super_interval_sec`, `heavy_interval_sec`, `usage_concurrency`, `on_demand_min_interval_sec` |
 | `cache.local` | `image_max_mb`, `video_max_mb` |
@@ -609,6 +672,31 @@ curl -L http://localhost:8000/v1/videos/<video_id>/content \
 
 <br>
 </details>
+
+<br>
+
+## 安全与防识别 🔒
+
+### 防识别机制
+
+| 层 | 机制 | 说明 |
+| :-- | :-- | :-- |
+| 网络层 | 账号粘性出口 | 订阅模式下每账号固定绑定一条最优线路，杜绝同账号多 IP 跳跃 |
+| 指纹层 | 每账号稳定 UA / 语言 | 由账号令牌确定性派生，且严格对齐 curl_cffi 可模拟的浏览器内核版本 |
+| 指纹层 | 动态 Statsig ID | 每次请求生成带变化的 fallback ID，避免静态指纹 |
+| 指纹层 | 可配置 Sentry Baggage | 上游发布更新后可在后台同步 release 哈希（`proxy.fingerprint.sentry_release`） |
+| 行为层 | 失败反馈降权 | 403/429/挑战自动降低节点与账号权重，触发冷却 |
+| 面板层 | 登录防爆破 + 安全响应头 | 5 次失败锁 15 分钟；`nosniff`/`DENY`/`no-referrer`/`no-store` |
+
+> [!WARNING]
+> **降低封号风险的核心原则**：一个账号 = 一个稳定 IP + 一个稳定设备指纹。不要频繁手动切换 `proxy.egress.mode`，不要在多个部署实例间共享同一批账号。上游风控持续演进，任何转换方案都无法保证绝对安全，请控制用量、做好账号隔离。
+
+### 部署安全清单
+
+- [ ] 修改默认管理密码 `app.app_key`（**切勿使用默认值 `grok2api` 上公网**）
+- [ ] 设置强随机 `app.api_key`
+- [ ] 不要把面板端口直接暴露公网，建议置于反代之后加访问控制
+- [ ] **绝不在仓库中提交 `.env` / `import.env` 等含凭据文件**（`.gitignore` 已覆盖；若历史中已有泄漏，立即轮换密码）
 
 <br>
 

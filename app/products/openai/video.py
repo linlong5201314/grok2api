@@ -326,7 +326,7 @@ async def _stream_video_request(
     timeout_s: float,
 ) -> AsyncGenerator[str, None]:
     proxy = await get_proxy_runtime()
-    lease = await proxy.acquire()
+    lease = await proxy.acquire(affinity_key=token)
     headers = build_http_headers(
         token,
         content_type="application/json",

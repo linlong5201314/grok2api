@@ -7,14 +7,13 @@
 
 from typing import Any, Dict, Optional
 
-import orjson
 
 from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
 from app.platform.errors import UpstreamError
 from app.control.proxy.models import ProxyFeedback, ProxyFeedbackKind, ProxyScope, RequestKind
 from app.dataplane.proxy import get_proxy_runtime
-from app.dataplane.proxy.adapters.headers import build_http_headers, build_ws_headers
+from app.dataplane.proxy.adapters.headers import build_ws_headers
 from app.dataplane.reverse.protocol.xai_livekit import (
     LIVEKIT_TOKEN_URL,
     build_token_request_payload,
@@ -46,7 +45,7 @@ async def fetch_livekit_token(
     timeout_s = cfg.get_float("voice.timeout", 60.0)
 
     proxy = await get_proxy_runtime()
-    lease = await proxy.acquire(scope=ProxyScope.APP, kind=RequestKind.HTTP)
+    lease = await proxy.acquire(affinity_key=token, scope=ProxyScope.APP, kind=RequestKind.HTTP)
 
     payload = build_token_request_payload(
         voice              = voice,
@@ -107,7 +106,7 @@ async def connect_livekit_ws(
     timeout = timeout_s if timeout_s is not None else cfg.get_float("voice.timeout", 120.0)
 
     proxy = await get_proxy_runtime()
-    lease = await proxy.acquire(scope=ProxyScope.APP, kind=RequestKind.WEBSOCKET)
+    lease = await proxy.acquire(affinity_key=token, scope=ProxyScope.APP, kind=RequestKind.WEBSOCKET)
 
     url     = build_ws_url(access_token)
     headers = build_ws_headers(token=token, lease=lease)

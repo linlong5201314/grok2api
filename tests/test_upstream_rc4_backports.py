@@ -93,7 +93,7 @@ def test_random_select_any_picks_active_account():
     regardless of per-mode quota."""
     from app.dataplane.account.selector import select_any, set_strategy, current_strategy
     from app.dataplane.account.table import make_empty_table
-    from app.dataplane.shared.enums import ModeId, PoolId, StatusId
+    from app.dataplane.shared.enums import PoolId, StatusId
 
     # Save current strategy to restore later
     old_strategy = current_strategy()

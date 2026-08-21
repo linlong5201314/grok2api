@@ -63,9 +63,10 @@ async def execute(
             latency_ms=int(now_ms() - t0),
         )
 
-    # Step 3: Acquire proxy
+    # Step 3: Acquire proxy — bound to the reserved account so subscription
+    # egress keeps one stable best-speed IP per account (anti-correlation).
     proxy_runtime = await get_proxy_runtime()
-    proxy_lease = await proxy_runtime.acquire()
+    proxy_lease = await proxy_runtime.acquire(affinity_key=lease.token)
 
     leases = ReverseLeaseSet(
         account_idx=lease.idx,

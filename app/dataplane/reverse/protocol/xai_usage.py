@@ -105,7 +105,7 @@ async def _do_fetch(token: str, mode_name: str) -> dict:
     from app.control.proxy.models import ProxyFeedback, ProxyFeedbackKind
 
     proxy = await get_proxy_runtime()
-    lease = await proxy.acquire()
+    lease = await proxy.acquire(affinity_key=token)
     try:
         body = await post_json(
             "https://grok.com/rest/rate-limits",
