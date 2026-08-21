@@ -26,7 +26,6 @@ from .models import NodeState, SubNode
 _ALPHA = 0.3          # EWMA weight for the newest sample
 _DEAD_THRESHOLD = 4   # consecutive failures before a node is marked dead
 _HEALTHY_MS = 900.0   # at or below this TTFB a node counts as healthy
-_DEGRADED_MS = 2500.0
 
 
 @dataclass(slots=True)
@@ -142,12 +141,9 @@ class NodeSpeedTester:
         node.fail_count = 0
         node.ok_count += 1
         node.last_probe_at = now_ms()
-        if latency_ms <= _HEALTHY_MS:
-            node.state = NodeState.HEALTHY
-        elif latency_ms <= _DEGRADED_MS:
-            node.state = NodeState.DEGRADED
-        else:
-            node.state = NodeState.DEGRADED
+        # Slow-but-alive nodes degrade instead of dying so bound accounts get
+        # a chance to re-bind only when the node truly stops answering.
+        node.state = NodeState.HEALTHY if latency_ms <= _HEALTHY_MS else NodeState.DEGRADED
         node.score = self.compute_score(node)
 
     def _apply_failure(self, node: SubNode) -> None:

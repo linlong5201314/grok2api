@@ -56,6 +56,11 @@ class SubscriptionManager:
         self._core = CoreRunner()
         self._refreshing = False
         self._restored_stats: dict[str, dict] = {}
+        # account_key -> node_id; survives restarts via the store file.
+        # Score reordering must NEVER reshuffle an existing binding — an
+        # account keeps its node until that node becomes unusable.
+        self._affinity: dict[str, str] = {}
+        self._affinity_flush_task: asyncio.Task | None = None
         self.stats = ManagerStats()
 
     # ------------------------------------------------------------------
@@ -321,12 +326,46 @@ class SubscriptionManager:
         return rank_nodes(list(self._nodes.values()))
 
     def pick_for_account(self, affinity_key: str | None) -> SubNode | None:
-        """Pick the best node, optionally bound to an account identity."""
+        """Pick the node bound to an account identity.
+
+        Binding policy (anti-correlation contract):
+        * First sight  — assign via ranked bucket and REMEMBER the choice.
+        * Return visits — always return the remembered node while it stays
+          usable, regardless of score reordering between speedtests.
+        * Node lost    — drop the binding and transparently re-bind.
+        Bindings persist across restarts through the store file.
+        """
         spread = max(1, get_config().get_int("proxy.subscription.affinity_spread", 3))
         if affinity_key:
-            return pick_for_affinity(list(self._nodes.values()), affinity_key, spread)
+            bound_id = self._affinity.get(affinity_key)
+            if bound_id:
+                node = self._nodes.get(bound_id)
+                if node is not None and node.is_usable:
+                    return node
+                # Stale binding (node gone / dead / no egress) — re-bind below.
+                self._affinity.pop(affinity_key, None)
+            chosen = pick_for_affinity(list(self._nodes.values()), affinity_key, spread)
+            if chosen is not None:
+                self._affinity[affinity_key] = chosen.node_id
+                self._schedule_affinity_flush()
+            return chosen
         ranked = self.ranked_nodes()
         return ranked[0] if ranked else None
+
+    def _schedule_affinity_flush(self) -> None:
+        """Debounced background persist after a binding change."""
+        if self._affinity_flush_task is not None and not self._affinity_flush_task.done():
+            return
+
+        async def _flush() -> None:
+            await asyncio.sleep(2.0)
+            await self.persist()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._affinity_flush_task = loop.create_task(_flush())
 
     def node_by_egress(self, proxy_url: str) -> SubNode | None:
         for node in self._nodes.values():
@@ -353,9 +392,14 @@ class SubscriptionManager:
     # ------------------------------------------------------------------
 
     async def persist(self) -> None:
+        # Drop bindings whose node no longer exists before writing.
+        self._affinity = {
+            k: nid for k, nid in self._affinity.items() if nid in self._nodes
+        }
         payload = {
             "version": 1,
             "sources": [s.model_dump() for s in self._sources.values()],
+            "affinity": dict(self._affinity),
             "nodes": {
                 nid: {
                     "latency_ms": n.latency_ms,
@@ -391,10 +435,16 @@ class SubscriptionManager:
                 self._sources[src.source_id] = src
             stats_map: dict[str, dict] = payload.get("nodes", {})
             self._restored_stats = stats_map
+            raw_affinity = payload.get("affinity", {})
+            if isinstance(raw_affinity, dict):
+                self._affinity = {
+                    str(k): str(v) for k, v in raw_affinity.items() if v
+                }
             logger.info(
-                "subscription store restored: sources={} stat_entries={}",
+                "subscription store restored: sources={} stat_entries={} bindings={}",
                 len(self._sources),
                 len(stats_map),
+                len(self._affinity),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("subscription restore failed: error={}", exc)

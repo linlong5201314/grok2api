@@ -265,7 +265,29 @@ class ProxyDirectory:
             from .subscription import get_subscription_manager
 
             node = get_subscription_manager().pick_for_account(affinity_key)
-            return node.egress_url if node else None
+            if node is not None and node.egress_url:
+                return node.egress_url
+            # Pool exhausted.  Default is FAIL-CLOSED: erroring out beats
+            # silently egressing every account from the server's real IP.
+            allow_direct = get_config().get_bool(
+                "proxy.subscription.allow_direct_fallback", False
+            )
+            if allow_direct:
+                logger.warning(
+                    "subscription pool empty; direct fallback ENABLED — "
+                    "accounts share the server IP"
+                )
+                return None
+            logger.error(
+                "subscription pool empty (affinity={}); refusing direct "
+                "fallback — set proxy.subscription.allow_direct_fallback=true "
+                "to allow it",
+                (affinity_key or "")[-6:],
+            )
+            raise RuntimeError(
+                "subscription proxy pool has no usable nodes; "
+                "direct fallback disabled by policy"
+            )
         async with self._lock:
             # Prefer resource-specific nodes when available; fall back to base nodes.
             nodes = (

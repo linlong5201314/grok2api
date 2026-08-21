@@ -103,6 +103,9 @@ speedtest_concurrency = 8
 max_nodes = 64
 # 每账号粘性候选节点数：账号在其间稳定绑定一个出口 IP（防关联跳 IP）
 affinity_spread = 3
+# 订阅池耗尽时是否允许直连回落。默认 false（拒绝直连、显式报错），
+# 防止全部账号突然从服务器真实 IP 出站造成关联封号。
+allow_direct_fallback = false
 # 拉取订阅时使用的 User-Agent（机场按 UA 下发不同格式）
 fetch_user_agent = "ClashMetaForAndroid/2.11.5.Meta"
 # sing-box 可执行文件路径（可选；配置后 vmess/vless/trojan/ss 节点经本地 core 出口）

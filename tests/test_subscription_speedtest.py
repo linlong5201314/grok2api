@@ -1,5 +1,6 @@
 """Speed-test scoring and affinity binding tests (no network access)."""
 
+import pytest
 
 from app.control.proxy.subscription.models import NodeState, SubNode, SubProtocol
 from app.control.proxy.subscription.speedtest import (
@@ -111,3 +112,134 @@ class TestAffinity:
             idx = affinity_index(f"k{i}", 3)
             assert 0 <= idx < 3
         assert affinity_index("x", 1) == 0
+
+
+# ---------------------------------------------------------------------------
+# Manager-level persistent sticky binding (anti-correlation contract)
+# ---------------------------------------------------------------------------
+
+import app.control.proxy.subscription as _sub_pkg
+from app.control.proxy.subscription import SubscriptionManager
+
+
+def _live_node(node_id: str, server: str, score: float) -> SubNode:
+    n = SubNode(
+        node_id=node_id,
+        name=node_id,
+        protocol=SubProtocol.SOCKS5,
+        server=server,
+        port=1080,
+        source_id="s1",
+        egress_url=f"socks5h://{server}:1080",
+        state=NodeState.HEALTHY,
+    )
+    n.score = score
+    n.latency_ms = round(1000.0 / max(score, 0.001), 1)
+    return n
+
+
+class TestPersistentStickyBinding:
+    def _mgr(self) -> SubscriptionManager:
+        return SubscriptionManager()
+
+    @staticmethod
+    def _seed(mgr: SubscriptionManager, scores: dict[str, float]) -> None:
+        mgr._merge_nodes(
+            "s1",
+            [_live_node(nid, f"10.0.0.{i}", sc) for i, (nid, sc) in enumerate(scores.items())],
+        )
+
+    @pytest.mark.asyncio
+    async def test_binding_survives_score_reorder(self, monkeypatch):
+        """THE anti-correlation fix: score drift must never reshuffle a live binding."""
+        mgr = self._mgr()
+        self._seed(mgr, {"A": 9.0, "B": 5.0, "C": 1.0})
+        first = mgr.pick_for_account("acct-1")
+        assert first is not None
+        # Simulate a speedtest where B becomes fastest and A drops to last.
+        mgr._nodes["A"].score = 0.5
+        mgr._nodes["B"].score = 9.9
+        mgr._nodes["C"].score = 2.0
+        again = mgr.pick_for_account("acct-1")
+        assert again.node_id == first.node_id, (
+            "account hopped nodes after score reorder — stickiness broken"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rebind_only_when_node_unusable(self):
+        mgr = self._mgr()
+        self._seed(mgr, {"A": 8.0, "B": 4.0})
+        bound = mgr.pick_for_account("acct-2")
+        mgr._nodes[bound.node_id].state = NodeState.DEAD
+        mgr._nodes[bound.node_id].egress_url = ""
+        rebound = mgr.pick_for_account("acct-2")
+        assert rebound is not None and rebound.node_id != bound.node_id
+        assert mgr._affinity["acct-2"] == rebound.node_id
+
+    @pytest.mark.asyncio
+    async def test_binding_persists_across_restart(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_sub_pkg, "data_path", lambda name: tmp_path / name)
+        mgr = self._mgr()
+        self._seed(mgr, {"A": 7.0, "B": 3.0})
+        chosen = mgr.pick_for_account("acct-3")
+        await mgr.persist()
+
+        mgr2 = self._mgr()
+        await mgr2.restore()
+        self._seed(mgr2, {"A": 7.0, "B": 3.0})
+        assert mgr2.pick_for_account("acct-3").node_id == chosen.node_id
+
+    @pytest.mark.asyncio
+    async def test_stale_restored_binding_pruned_on_pick(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_sub_pkg, "data_path", lambda name: tmp_path / name)
+        mgr = self._mgr()
+        self._seed(mgr, {"A": 7.0, "B": 3.0})
+        chosen = mgr.pick_for_account("acct-4")
+        await mgr.persist()
+
+        # Restart into a world where exactly the bound node vanished.
+        survivor = "B" if chosen.node_id == "A" else "A"
+        mgr2 = self._mgr()
+        await mgr2.restore()
+        self._seed(mgr2, {"A": 7.0, "B": 3.0})
+        del mgr2._nodes[chosen.node_id]
+        picked = mgr2.pick_for_account("acct-4")
+        # Invariant: stale binding pruned, account re-bound to the survivor.
+        assert picked is not None and picked.node_id == survivor
+        assert mgr2._affinity["acct-4"] == survivor
+
+
+class TestFailClosedOnEmptyPool:
+    @staticmethod
+    def _dir() -> "object":
+        from app.control.proxy import ProxyDirectory
+        from app.control.proxy.models import EgressMode
+
+        d = ProxyDirectory()
+        d._egress_mode = EgressMode.SUBSCRIPTION
+        return d
+
+    @pytest.mark.asyncio
+    async def test_empty_pool_raises_by_default(self, monkeypatch):
+        empty = SubscriptionManager()
+        monkeypatch.setattr(
+            _sub_pkg, "get_subscription_manager", lambda: empty
+        )
+        with pytest.raises(RuntimeError, match="no usable nodes"):
+            await self._dir()._pick_proxy_url(affinity_key="tok-x")
+
+    @pytest.mark.asyncio
+    async def test_direct_fallback_escape_hatch(self, monkeypatch):
+        empty = SubscriptionManager()
+        monkeypatch.setattr(
+            _sub_pkg, "get_subscription_manager", lambda: empty
+        )
+
+        class _Cfg:
+            def get_bool(self, key, default=False):
+                return True  # allow_direct_fallback=true
+
+        import app.control.proxy as _proxy_pkg
+
+        monkeypatch.setattr(_proxy_pkg, "get_config", lambda: _Cfg())
+        assert await self._dir()._pick_proxy_url(affinity_key="tok-x") is None
