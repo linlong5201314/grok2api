@@ -55,3 +55,6 @@ htmlcov/
 
 # Project specific
 .ace-tool/
+
+# Local agent tooling config
+AGENTS.md
