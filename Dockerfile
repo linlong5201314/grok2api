@@ -59,18 +59,14 @@ RUN apk add --no-cache \
 
 # Bundle sing-box so subscription core-protocol nodes (vmess/vless/trojan/ss/
 # hysteria2) work out of the box; the app auto-detects it on PATH.
-ARG SINGBOX_VERSION=1.13.19
-RUN ARCH="$(uname -m)" \
-    && case "$ARCH" in \
-        x86_64)  SB_ARCH="amd64" ;; \
-        aarch64) SB_ARCH="arm64" ;; \
-        *) SB_ARCH="amd64" ;; \
-    esac \
-    && wget -qO /tmp/sb.tgz \
-        "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${SB_ARCH}.tar.gz" \
-    && tar -xzf /tmp/sb.tgz -C /tmp \
-    && install -m755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-${SB_ARCH}/sing-box" /usr/local/bin/sing-box \
-    && rm -rf /tmp/sb.tgz "/tmp/sing-box-${SINGBOX_VERSION}-linux-${SB_ARCH}" \
+#
+# NOTE: official SagerNet release tarballs are glibc-DYNAMICALLY linked and
+# abort with "sing-box: not found" on musl-based Alpine (the ELF interpreter
+# /lib64/ld-linux-x86-64.so.2 does not exist there). Use Alpine's own
+# natively-compiled package from edge/community instead.
+RUN apk add --no-cache \
+        --repository https://dl-cdn.alpinelinux.org/alpine/edge/community \
+    sing-box \
     && sing-box version
 
 WORKDIR /app
