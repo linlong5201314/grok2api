@@ -2,6 +2,8 @@
 
 import pytest
 
+import app.control.proxy.subscription as _sub_pkg
+from app.control.proxy.subscription import SubscriptionManager
 from app.control.proxy.subscription.models import NodeState, SubNode, SubProtocol
 from app.control.proxy.subscription.speedtest import (
     NodeSpeedTester,
@@ -117,9 +119,6 @@ class TestAffinity:
 # ---------------------------------------------------------------------------
 # Manager-level persistent sticky binding (anti-correlation contract)
 # ---------------------------------------------------------------------------
-
-import app.control.proxy.subscription as _sub_pkg
-from app.control.proxy.subscription import SubscriptionManager
 
 
 def _live_node(node_id: str, server: str, score: float) -> SubNode:
