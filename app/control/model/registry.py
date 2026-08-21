@@ -36,6 +36,13 @@ MODELS: tuple[ModelSpec, ...] = (
     # Super+（basic 池不支持此模式）
     ModelSpec("grok-4.3-beta",                          ModeId.GROK_4_3, Tier.SUPER, Capability.CHAT,       True, "Grok 4.3 Beta"),
 
+    # === grok-4.5 别名（2026-08 实测：上游 fast/expert/heavy 已是 Grok 4.5）====
+    # 模式名未变，仅上游模型代际更新；提供新命名别名，旧名继续可用。
+    ModelSpec("grok-4.5-fast",                          ModeId.FAST,     Tier.BASIC, Capability.CHAT,       True, "Grok 4.5 Fast",           prefer_best=True),
+    ModelSpec("grok-4.5-auto",                          ModeId.AUTO,     Tier.SUPER, Capability.CHAT,       True, "Grok 4.5 Auto",           prefer_best=True),
+    ModelSpec("grok-4.5-expert",                        ModeId.EXPERT,   Tier.SUPER, Capability.CHAT,       True, "Grok 4.5 Expert",         prefer_best=True),
+    ModelSpec("grok-4.5-heavy",                         ModeId.HEAVY,    Tier.HEAVY, Capability.CHAT,       True, "Grok 4.5 Heavy",          prefer_best=True),
+
     # === Image ==============================================================
 
     # Basic fast

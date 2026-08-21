@@ -108,11 +108,20 @@ class SubscriptionManager:
         return sorted(self._sources.values(), key=lambda s: s.created_sort_key())
 
     async def add_source(self, *, name: str, url: str) -> SubscriptionSource:
-        from app.platform.runtime.ids import next_hex
+        # Random id, NOT the process counter: next_hex() restarts at zero on
+        # every deploy and can collide with ids restored from the store,
+        # silently overwriting an existing subscription.
+        import uuid
 
         async with self._lock:
+            sid = uuid.uuid4().hex[:10]
+            while sid in self._sources:
+                sid = uuid.uuid4().hex[:10]
             src = SubscriptionSource(
-                source_id=next_hex()[:10], name=name or "订阅", url=url.strip()
+                source_id=sid,
+                name=name or "订阅",
+                url=url.strip(),
+                created_at=now_ms(),
             )
             self._sources[src.source_id] = src
         await self.persist()

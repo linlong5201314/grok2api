@@ -308,6 +308,21 @@ def _node_to_outbound(node: SubNode) -> dict | None:
         base.update({"type": "trojan", "password": node.credential})
     elif p.value == "hysteria2":
         base.update({"type": "hysteria2", "password": node.credential})
+    elif p.value == "tuic":
+        if not node.credential:
+            return None
+        tuic_uuid, _, tuic_pwd = node.credential.partition(":")
+        if not tuic_uuid:
+            return None
+        base.update(
+            {
+                "type": "tuic",
+                "uuid": tuic_uuid,
+                "password": tuic_pwd,
+                "congestion_control": "bbr",
+                "udp_relay_mode": "native",
+            }
+        )
     else:
         return None
 

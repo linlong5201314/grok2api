@@ -49,26 +49,45 @@ def parse_subscription_payload(body: str | bytes, source_id: str = "") -> list[S
         return []
 
     nodes: list[SubNode] = []
+    skipped: dict[str, int] = {}
     if _looks_like_clash_yaml(text):
         nodes = parse_clash_yaml(text, source_id=source_id)
     else:
         uris = _extract_uri_list(text)
-        nodes = [n for n in (_parse_share_uri(u, source_id=source_id) for u in uris) if n]
+        parsed: list[SubNode] = []
+        for u in uris:
+            n = _parse_share_uri(u, source_id=source_id)
+            if n is None:
+                scheme = u.split("://", 1)[0].lower()[:20]
+                key = f"scheme:{scheme}" if _URI_RE.match(u) else "malformed"
+                skipped[key] = skipped.get(key, 0) + 1
+            else:
+                parsed.append(n)
+        nodes = parsed
+        if skipped:
+            logger.info(
+                "subscription skipped entries: {} (unsupported schemes or "
+                "malformed links are not usable for egress)",
+                skipped,
+            )
 
     # De-duplicate by identity keeping first occurrence.
     seen: set[str] = set()
     unique: list[SubNode] = []
+    duplicates = 0
     for node in nodes:
         ident = node.identity()
         if ident in seen:
+            duplicates += 1
             continue
         seen.add(ident)
         unique.append(node)
     logger.debug(
-        "subscription parsed: source={} raw_nodes={} unique_nodes={}",
+        "subscription parsed: source={} raw_nodes={} unique_nodes={} dupes={}",
         source_id or "-",
         len(nodes),
         len(unique),
+        duplicates,
     )
     return unique
 
@@ -163,6 +182,7 @@ def _parse_share_uri(uri: str, source_id: str = "") -> SubNode | None:
             SubProtocol.VLESS: _parse_vless,
             SubProtocol.TROJAN: _parse_trojan,
             SubProtocol.HYSTERIA2: _parse_hysteria2,
+            SubProtocol.TUIC: _parse_tuic,
             SubProtocol.SOCKS5: _parse_simple,
             SubProtocol.SOCKS4: _parse_simple,
             SubProtocol.HTTP: _parse_simple,
@@ -324,6 +344,29 @@ def _parse_hysteria2(uri: str) -> SubNode | None:
         transport="udp",
         sni=q.get("sni", "") or host,
         allow_insecure=q.get("insecure", "0") in ("1", "true"),
+        raw_uri=uri,
+    )
+
+
+def _parse_tuic(uri: str) -> SubNode | None:
+    """tuic://uuid:password@host:port?sni=…&alpn=h3&congestion_control=bbr#name"""
+    url = urlparse(uri)
+    q = {k: v[0] for k, v in parse_qs(url.query).items()}
+    host, port = _split_hostport(url.netloc)
+    uuid_part = unquote(url.username or "")
+    password = unquote(url.password or "") if url.password else ""
+    # credential carries both halves; core_runner splits on the last colon.
+    credential = f"{uuid_part}:{password}" if password else uuid_part
+    return SubNode(
+        name=_name_from_fragment(url),
+        protocol=SubProtocol.TUIC,
+        server=host,
+        port=port,
+        credential=credential,
+        transport="udp",
+        sni=q.get("sni", "") or host,
+        alpn=[a for a in unquote(q.get("alpn", "")).split(",") if a],
+        allow_insecure=q.get("allow_insecure", q.get("insecure", "0")) in ("1", "true"),
         raw_uri=uri,
     )
 

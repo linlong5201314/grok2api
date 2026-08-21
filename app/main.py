@@ -357,6 +357,11 @@ def create_app() -> FastAPI:
             response.headers.setdefault("Referrer-Policy", "no-referrer")
             if path.startswith(("/admin/api", "/webui/api")):
                 response.headers.setdefault("Cache-Control", "no-store")
+            elif path.startswith("/static/"):
+                # Revalidate static assets (ETag → 304) so JS/CSS fixes land
+                # immediately instead of living in browser caches until the
+                # version query param happens to change.
+                response.headers.setdefault("Cache-Control", "no-cache")
         return response
 
     # Ensure config is loaded on every request.
