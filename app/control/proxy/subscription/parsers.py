@@ -158,6 +158,50 @@ def _looks_like_clash_yaml(text: str) -> bool:
     )[0][:200]
 
 
+def extract_provider_urls(text: str) -> list[str]:
+    """Extract remote proxy-provider URLs from a mihomo-style config.
+
+    Many airports ship a thin config that references real nodes through
+    ``proxy-providers:`` blocks (``type: http`` + ``url:``).  The inline
+    file itself has no proxies, so callers must fetch each provider URL and
+    parse its payload instead.
+    """
+    urls: list[str] = []
+    in_providers = False
+    provider_indent: int | None = None
+    for line in text.splitlines():
+        if re.match(r"^\s*proxy-providers\s*:\s*$", line):
+            in_providers = True
+            provider_indent = None
+            continue
+        if not in_providers:
+            continue
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if re.match(r"^\S", line):
+            in_providers = False  # next top-level key
+            continue
+        # First indented line sets the provider name indentation.
+        if provider_indent is None:
+            provider_indent = indent
+        if indent < provider_indent:
+            in_providers = False
+            continue
+        if indent == provider_indent:
+            continue  # provider name line (e.g. "  airport:")
+        # Only the provider's own url (one level below the name); nested
+        # blocks like health-check: have deeper indentation and must not be
+        # mistaken for a node source.
+        if indent == provider_indent + 2:
+            m = re.match(r"^\s*url\s*:\s*(.+)$", line)
+            if m:
+                u = m.group(1).strip().strip('"\'')
+                if u.startswith(("http://", "https://")):
+                    urls.append(u)
+    return urls
+
+
 # ---------------------------------------------------------------------------
 # Share-link parsers
 # ---------------------------------------------------------------------------
@@ -441,10 +485,10 @@ def parse_clash_yaml(text: str, source_id: str = "") -> list[SubNode]:
     pending: tuple[int, dict[str, Any], str] | None = None
 
     for line in lines[start:]:
-        if re.match(r"^\S", line):  # next top-level key → proxies section ended
-            break
         if not line.strip() or line.lstrip().startswith("#"):
             continue
+        if re.match(r"^\S", line):  # next top-level key → proxies section ended
+            break
         indent = len(line) - len(line.lstrip())
         stripped = line.strip()
 
@@ -628,6 +672,22 @@ def _clash_item_to_node(item: dict[str, Any], source_id: str) -> SubNode | None:
     alpn_raw = item.get("alpn")
     alpn = [str(a) for a in alpn_raw] if isinstance(alpn_raw, list) else []
 
+    # shadowsocks obfs / v2ray-plugin (sing-box shadowsocks plugin support).
+    plugin = ""
+    if protocol == SubProtocol.SS:
+        pname = str(item.get("plugin", "") or "").strip().lower()
+        popts = item.get("plugin-opts")
+        if pname == "obfs":
+            popts_d = popts if isinstance(popts, dict) else {}
+            obfs_mode = str(popts_d.get("mode", "") or "tls").lower()
+            obfs_host = str(popts_d.get("host", "") or "")
+            parts = [f"obfs={obfs_mode}"]
+            if obfs_host:
+                parts.append(f"obfs-host={obfs_host}")
+            plugin = ";".join(parts)
+        elif pname == "v2ray-plugin":
+            plugin = f"v2ray-plugin={str(popts if isinstance(popts, str) else '')}"
+
     node = SubNode(
         name=str(item.get("name", "")),
         protocol=protocol,
@@ -642,6 +702,7 @@ def _clash_item_to_node(item: dict[str, Any], source_id: str) -> SubNode | None:
         alpn=alpn,
         allow_insecure=bool(item.get("skip-cert-verify", False)),
         udp=bool(item.get("udp", True)),
+        plugin=plugin,
         source_id=source_id,
     )
     node.node_id = _make_node_id(source_id, node.identity())

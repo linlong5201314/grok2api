@@ -4,6 +4,8 @@ import pytest
 
 import app.control.proxy.subscription as _sub_pkg
 from app.control.proxy.subscription import SubscriptionManager
+from app.control.proxy.subscription.core_runner import _node_to_outbound
+from app.control.proxy.subscription.parsers import extract_provider_urls, parse_subscription_payload
 from app.control.proxy.subscription.models import NodeState, SubNode, SubProtocol
 from app.control.proxy.subscription.speedtest import (
     NodeSpeedTester,
@@ -293,3 +295,68 @@ class TestEmptyFetchKeepsPool:
         fresh = [_live_node("C", "10.9.9.9", 5.0)]
         mgr._merge_nodes("s1", fresh)
         assert set(mgr._nodes) == {"C"}  # old A/B replaced by C
+
+
+class TestClashCommentAndProvider:
+    """Clash configs with leading comments / proxy-providers must parse."""
+
+    def test_comment_before_proxies_does_not_break(self):
+        body = (
+            "# GLaDOS\n# generated file\nproxies:\n"
+            "  - name: A1\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n"
+            "    cipher: aes-256-gcm\n    password: p1\n"
+        )
+        nodes = parse_subscription_payload(body, source_id="c1")
+        assert len(nodes) == 1
+        assert nodes[0].name == "A1"
+
+    def test_comment_inside_proxies_section_ok(self):
+        body = (
+            "proxies:\n"
+            "# Fast outbound\n"
+            "  - name: A1\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n"
+            "    cipher: aes-256-gcm\n    password: p1\n"
+        )
+        nodes = parse_subscription_payload(body, source_id="c2")
+        assert len(nodes) == 1
+
+    def test_proxy_providers_urls_extracted(self):
+        body = (
+            "proxy-providers:\n"
+            "  airport:\n"
+            "    type: http\n"
+            "    url: https://example.com/sub?token=abc\n"
+            "    interval: 86400\n"
+            "    health-check:\n"
+            "      enable: true\n"
+            "      url: https://chat.example.com/\n"
+            "proxy-groups:\n"
+            "  - name: g\n    type: select\n"
+        )
+        urls = extract_provider_urls(body)
+        assert urls == ["https://example.com/sub?token=abc"]
+
+    def test_ss_obfs_plugin_preserved(self):
+        body = (
+            "proxies:\n"
+            "  - name: Fast-B1-1\n    type: ss\n    server: a.b.c\n    port: 2377\n"
+            "    cipher: chacha20-ietf-poly1305\n    password: pw\n"
+            "    plugin: obfs\n    plugin-opts:\n"
+            "      mode: tls\n      host: c.example.com:219122\n"
+        )
+        nodes = parse_subscription_payload(body, source_id="c3")
+        assert len(nodes) == 1
+        assert "obfs=tls" in nodes[0].plugin
+        assert "obfs-host=c.example.com:219122" in nodes[0].plugin
+        ob = _node_to_outbound(nodes[0])
+        assert ob["plugin"] == "obfs-local"
+        assert "obfs=tls" in ob["plugin_opts"]
+
+    def test_http_and_socks_outbounds(self):
+        from app.control.proxy.subscription.models import SubNode, SubProtocol
+        h = SubNode(protocol=SubProtocol.HTTP, server="1.2.3.4", port=8080, credential="u:p")
+        ob = _node_to_outbound(h)
+        assert ob["type"] == "http" and ob["username"] == "u" and ob["password"] == "p"
+        s = SubNode(protocol=SubProtocol.SOCKS5, server="5.6.7.8", port=1080)
+        ob2 = _node_to_outbound(s)
+        assert ob2["type"] == "socks"

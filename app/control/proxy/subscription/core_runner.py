@@ -287,6 +287,31 @@ def _node_to_outbound(node: SubNode) -> dict | None:
         if not node.method or not node.credential:
             return None
         base.update({"type": "shadowsocks", "method": node.method, "password": node.credential})
+        if node.plugin:
+            if node.plugin.startswith("v2ray-plugin"):
+                base["plugin"] = "v2ray-plugin"
+                base["plugin_opts"] = node.plugin.split("=", 1)[1]
+            else:  # obfs mode string like "obfs=tls;obfs-host=host"
+                base["plugin"] = "obfs-local"
+                base["plugin_opts"] = node.plugin
+    elif p.value == "http":
+        base.update({"type": "http"})
+        if node.credential:
+            user, _, pwd = node.credential.partition(":")
+            base["username"] = user
+            base["password"] = pwd
+    elif p.value == "https":
+        base.update({"type": "http", "tls": {"enabled": True}})
+        if node.credential:
+            user, _, pwd = node.credential.partition(":")
+            base["username"] = user
+            base["password"] = pwd
+    elif p.value == "socks5" or p.value == "socks4":
+        base.update({"type": "socks"})
+        if node.credential:
+            user, _, pwd = node.credential.partition(":")
+            base["username"] = user
+            base["password"] = pwd
     elif p.value == "vmess":
         if not node.credential:
             return None

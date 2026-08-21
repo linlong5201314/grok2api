@@ -25,12 +25,30 @@ from app.platform.runtime.clock import now_ms
 
 from .core_runner import CoreRunner
 from .models import NodeState, SubNode, SubscriptionFetchResult, SubscriptionSource
-from .parsers import parse_subscription_payload
+from .parsers import extract_provider_urls, parse_subscription_payload
 from .speedtest import NodeSpeedTester, pick_for_affinity, rank_nodes
 
 _STORE_FILE = "proxy_subscriptions.json"
 _FETCH_TIMEOUT_S = 20.0
 _MAX_BODY_BYTES = 8 * 1024 * 1024
+
+
+def _decode_body(raw: bytes) -> str:
+    """Decode subscription bytes to text (utf-8 → gb18030 → replace)."""
+    for enc in ("utf-8", "utf-16", "gb18030"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _mask_url(url: str) -> str:
+    """Redact query params from a provider URL for logs."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 class ManagerStats(BaseModel):
@@ -187,6 +205,43 @@ class SubscriptionManager:
             )
 
         nodes = parse_subscription_payload(body, source_id=source.source_id)
+        # mihomo "thin" configs reference real nodes via proxy-providers
+        # instead of inline proxies: fetch each provider URL and merge.
+        if not nodes:
+            provider_urls = extract_provider_urls(_decode_body(body))
+            if provider_urls:
+                for purl in provider_urls:
+                    try:
+                        async with aiohttp.ClientSession(
+                            timeout=aiohttp.ClientTimeout(total=_FETCH_TIMEOUT_S),
+                            headers={"User-Agent": ua},
+                        ) as p_session:
+                            async with p_session.get(purl) as presp:
+                                if presp.status != 200:
+                                    logger.warning(
+                                        "proxy-provider fetch failed: source={} url={} status={}",
+                                        source.source_id,
+                                        _mask_url(purl),
+                                        presp.status,
+                                    )
+                                    continue
+                                pbody = await presp.content.read(_MAX_BODY_BYTES)
+                        pnodes = parse_subscription_payload(
+                            pbody, source_id=source.source_id
+                        )
+                        logger.info(
+                            "proxy-provider fetched: source={} provider_nodes={}",
+                            source.source_id,
+                            len(pnodes),
+                        )
+                        nodes.extend(pnodes)
+                    except Exception as exc:  # noqa: BLE001 — network errors are routine
+                        logger.warning(
+                            "proxy-provider fetch failed: source={} url={} error={}",
+                            source.source_id,
+                            _mask_url(purl),
+                            str(exc)[:200],
+                        )
         duration = int((time.perf_counter() - t0) * 1000)
         source.last_fetch_ok = True
         source.last_error = ""
