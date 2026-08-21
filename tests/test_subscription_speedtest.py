@@ -242,3 +242,27 @@ class TestFailClosedOnEmptyPool:
 
         monkeypatch.setattr(_proxy_pkg, "get_config", lambda: _Cfg())
         assert await self._dir()._pick_proxy_url(affinity_key="tok-x") is None
+
+
+class TestCoreFailureCleanup:
+    @pytest.mark.asyncio
+    async def test_core_failure_clears_stale_egress(self):
+        """Without sing-box, core nodes must not keep phantom egress URLs."""
+        from app.control.proxy.subscription.models import NodeState, SubNode, SubProtocol
+
+        mgr = SubscriptionManager()
+        vmess = SubNode(
+            node_id="v1",
+            protocol=SubProtocol.VMESS,
+            server="svc.example",
+            port=443,
+            credential="uuid-1234",
+            source_id="s1",
+        )
+        mgr._merge_nodes("s1", [vmess])
+        # Simulate a previous generation having assigned a working egress.
+        mgr._nodes["v1"].egress_url = "http://127.0.0.1:21001"
+        mgr._nodes["v1"].state = NodeState.NEW
+        await mgr._rebuild_egress()
+        assert mgr._nodes["v1"].state == NodeState.NEEDS_CORE
+        assert mgr._nodes["v1"].egress_url == ""

@@ -282,10 +282,12 @@ class SubscriptionManager:
 
         port_map = await self._core.ensure_running(need_core)
         for node in need_core:
-            port = port_map.get(node.node_id)
-            if port:
+            if port_map.get(node.node_id):
                 node.state = NodeState.NEW
-            elif not node.egress_url:
+            else:
+                # Core unavailable or failed for this node — clear any stale
+                # egress assigned during config generation so the node is
+                # excluded from selection instead of pointing at a dead port.
                 node.state = NodeState.NEEDS_CORE
                 node.egress_url = ""
         self._update_stats()
