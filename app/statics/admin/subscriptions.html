@@ -55,6 +55,9 @@
     .state-dot{width:8px;height:8px;border-radius:999px;flex-shrink:0}
     .state-ok{background:var(--success)} .state-bad{background:var(--error)} .state-off{background:#ccc}
     .node-err{font-size:10px;color:var(--error,#e06c6c);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .egress-banner{padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:13px;line-height:1.6}
+    .egress-banner-error{background:rgba(224,108,108,.12);border:1px solid rgba(224,108,108,.45);color:var(--error,#e06c6c)}
+    .egress-banner-warn{background:rgba(230,170,80,.12);border:1px solid rgba(230,170,80,.45);color:#d9a34a}
 
     /* 节点表 */
     .table-wrap{overflow-x:auto}
@@ -97,6 +100,9 @@
       <button class="btn" onclick="refreshAll()" data-i18n="subs.refreshAll">刷新全部订阅</button>
     </div>
   </div>
+
+  <!-- 出口模式警告横幅 -->
+  <div id="egress-banner" class="egress-banner hidden" style="display:none"></div>
 
   <!-- 统计 -->
   <div class="stats-row">
@@ -198,6 +204,7 @@ async function load() {
       _api('GET', '/proxy/subscriptions'),
       _api('GET', '/proxy/nodes'),
     ]);
+    renderEgressBanner(subs.egress_mode);
     renderStats(subs.stats);
     renderSources(subs.sources);
     renderNodes(nodes);
@@ -205,6 +212,21 @@ async function load() {
     document.getElementById('core-hint').textContent = subs.stats.core_running
       ? t('subs.coreRunning') : '';
   } catch (e) { showToast(e.message || e, 'error'); }
+}
+
+function renderEgressBanner(mode) {
+  const el = document.getElementById('egress-banner');
+  if (mode === 'subscription') {
+    el.style.display = 'none';
+    return;
+  }
+  const label = mode === 'direct' ? '直连' : mode;
+  const isDirect = mode === 'direct';
+  el.className = 'egress-banner ' + (isDirect ? 'egress-banner-error' : 'egress-banner-warn');
+  el.innerHTML = isDirect
+    ? `⚠️ 当前出口模式为 <b>直连</b>：订阅节点<b>不会生效</b>，所有请求将从服务器 IP 直连（数据中心 IP 极易被 grok.com 的 Cloudflare 拦截，返回 403）。请到「配置」页将 <b>代理模式</b> 切换为 <b>机场订阅</b> 并保存。`
+    : `⚠️ 当前出口模式为 <b>${esc(label)}</b>：订阅节点未参与出口。如需使用订阅，请到「配置」页将代理模式切换为<b>机场订阅</b>。`;
+  el.style.display = 'block';
 }
 
 function renderStats(s) {
@@ -294,6 +316,10 @@ async function addSource() {
     const res = await _api('POST', '/proxy/subscriptions', { name: nameEl.value.trim(), url });
     if (res.fetch?.ok) showToast(`${t('subs.added')} · ${res.fetch.node_count} ${t('subs.nodesUnit')}`, 'success');
     else showToast(res.fetch?.error || t('subs.fetchFailed'), 'error');
+    if (res.egress_warning) {
+      showToast(res.egress_warning, 'error');
+      renderEgressBanner(res.egress_mode);
+    }
     urlEl.value = ''; nameEl.value = '';
     load();
   } catch (e) { showToast(e.message || e, 'error'); }

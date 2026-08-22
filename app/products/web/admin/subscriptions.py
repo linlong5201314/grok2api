@@ -20,6 +20,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.control.proxy.subscription import get_subscription_manager
+from app.platform.config.snapshot import get_config
 from app.platform.errors import AppError, ValidationError
 from app.platform.logging.logger import logger
 
@@ -72,6 +73,7 @@ async def list_subscriptions():
         {
             "stats": manager.stats.model_dump(),
             "sources": [_source_dict(s) for s in manager.list_sources()],
+            "egress_mode": get_config().get_str("proxy.egress.mode", "direct"),
         }
     )
 
@@ -86,11 +88,18 @@ async def add_subscription(req: AddSourceRequest):
     result = await get_subscription_manager().fetch_source(src)
     await get_subscription_manager()._rebuild_egress()  # noqa: SLF001
     await get_subscription_manager().persist()
+    egress_mode = get_config().get_str("proxy.egress.mode", "direct")
     return _json(
         {
             "status": "success",
             "source": _source_dict(src),
             "fetch": result.model_dump(),
+            "egress_mode": egress_mode,
+            "egress_warning": (
+                None
+                if egress_mode == "subscription"
+                else f"当前出口模式为 {egress_mode}，订阅节点不会生效，请在「配置」页切换到机场订阅"
+            ),
         }
     )
 
