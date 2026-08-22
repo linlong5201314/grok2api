@@ -196,6 +196,7 @@ def _record_to_patch(r) -> "AccountPatch":
         quota_expert=qs.expert.to_dict() if qs.expert else None,
         quota_heavy=qs.heavy.to_dict()    if qs.heavy    else None,
         quota_grok_4_3=qs.grok_4_3.to_dict() if qs.grok_4_3 else None,
+        quota_build=qs.build.to_dict() if qs.build else None,
         # Usage counts — target starts at 0, so actual value == delta.
         usage_use_delta=r.usage_use_count   or None,
         usage_fail_delta=r.usage_fail_count or None,

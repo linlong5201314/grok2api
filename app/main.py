@@ -112,6 +112,16 @@ async def lifespan(app: FastAPI):
         platform.system(),
     )
 
+    # Warn loudly when the admin panel still runs on the default password —
+    # anyone can read tokens from /admin/api/tokens with it.
+    _admin_key = str(_config.get_str("app.app_key", "grok2api"))
+    if _admin_key == "grok2api":
+        logger.warning(
+            "security: admin panel uses the DEFAULT app_key 'grok2api'; "
+            "set GROK_APP_APP_KEY (env) or app.app_key in config to a strong "
+            "random value — the default lets anyone read /admin/api/tokens"
+        )
+
     # 2. Initialise account repository and bootstrap runtime table.
     from app.control.account.backends.factory import (
         create_repository,

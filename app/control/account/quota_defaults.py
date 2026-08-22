@@ -47,6 +47,7 @@ BASIC_QUOTA_DEFAULTS = AccountQuotaSet(
     auto=_w(0, 0, 0),  # unsupported on basic accounts
     fast=_w(BASIC_FAST_LIMIT, BASIC_FAST_LIMIT, BASIC_FAST_WINDOW_SECONDS),
     expert=_w(0, 0, 0),  # unsupported on basic accounts
+    build=_w(10, 10, 7_200),  # 10  queries / 2 h (2026-08 live probe)
 )
 
 SUPER_QUOTA_DEFAULTS = AccountQuotaSet(
@@ -54,6 +55,7 @@ SUPER_QUOTA_DEFAULTS = AccountQuotaSet(
     fast=_w(140, 140, 7_200),  # 140 queries / 2 h
     expert=_w(50, 50, 7_200),  # 50  queries / 2 h
     grok_4_3=_w(50, 50, 7_200),  # 50  queries / 2 h
+    build=_w(30, 30, 7_200),  # 30  queries / 2 h
 )
 
 HEAVY_QUOTA_DEFAULTS = AccountQuotaSet(
@@ -62,6 +64,7 @@ HEAVY_QUOTA_DEFAULTS = AccountQuotaSet(
     expert=_w(150, 150, 7_200),  # 150 queries / 2 h
     heavy=_w(20, 20, 7_200),  # 20  queries / 2 h
     grok_4_3=_w(150, 150, 7_200),  # 150 queries / 2 h
+    build=_w(50, 50, 7_200),  # 50  queries / 2 h
 )
 
 # Map pool name → defaults object (used by backends on upsert).
@@ -72,9 +75,9 @@ _POOL_DEFAULTS: dict[str, AccountQuotaSet] = {
 }
 
 _SUPPORTED_MODE_IDS_BY_POOL: dict[str, frozenset[int]] = {
-    "basic": frozenset((1,)),
-    "super": frozenset((0, 1, 2, 4)),
-    "heavy": frozenset((0, 1, 2, 3, 4)),
+    "basic": frozenset((1, 5)),
+    "super": frozenset((0, 1, 2, 4, 5)),
+    "heavy": frozenset((0, 1, 2, 3, 4, 5)),
 }
 
 # ---------------------------------------------------------------------------
@@ -102,6 +105,10 @@ def default_quota_set(pool: str) -> AccountQuotaSet:
         qs.grok_4_3 = _w(
             src.grok_4_3.remaining, src.grok_4_3.total, src.grok_4_3.window_seconds
         )
+    if src.build is not None:
+        qs.build = _w(
+            src.build.remaining, src.build.total, src.build.window_seconds
+        )
     return qs
 
 
@@ -117,7 +124,9 @@ def supported_mode_ids(pool: str) -> tuple[int, ...]:
     supported = _SUPPORTED_MODE_IDS_BY_POOL.get(
         pool, _SUPPORTED_MODE_IDS_BY_POOL["basic"]
     )
-    return tuple(mode_id for mode_id in (0, 1, 2, 3, 4) if mode_id in supported)
+    return tuple(
+        mode_id for mode_id in (0, 1, 2, 3, 4, 5) if mode_id in supported
+    )
 
 
 def default_quota_window(pool: str, mode_id: int) -> QuotaWindow | None:
@@ -156,6 +165,7 @@ def normalize_quota_set(pool: str, quota_set: AccountQuotaSet) -> AccountQuotaSe
     qs = AccountQuotaSet(auto=auto, fast=fast, expert=expert)
     qs.heavy = normalize_quota_window(pool, 3, quota_set.heavy)
     qs.grok_4_3 = normalize_quota_window(pool, 4, quota_set.grok_4_3)
+    qs.build = normalize_quota_window(pool, 5, quota_set.build)
     return qs
 
 

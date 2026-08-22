@@ -65,6 +65,7 @@ class LocalAccountRepository:
                     quota_expert       TEXT    NOT NULL DEFAULT '{{}}',
                     quota_heavy        TEXT    NOT NULL DEFAULT '{{}}',
                     quota_grok_4_3     TEXT    NOT NULL DEFAULT '{{}}',
+                    quota_build        TEXT    NOT NULL DEFAULT '{{}}',
                     usage_use_count    INTEGER NOT NULL DEFAULT 0,
                     usage_fail_count   INTEGER NOT NULL DEFAULT 0,
                     usage_sync_count   INTEGER NOT NULL DEFAULT 0,
@@ -86,6 +87,7 @@ class LocalAccountRepository:
                     ON {_TBL} (deleted_at) WHERE deleted_at IS NOT NULL;
             """)
             self._ensure_column_sync(conn, "quota_grok_4_3", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column_sync(conn, "quota_build", "TEXT NOT NULL DEFAULT '{}'")
             conn.commit()
 
     @staticmethod
@@ -115,14 +117,17 @@ class LocalAccountRepository:
         d["tags"]  = json.loads(d.get("tags")  or "[]")
         heavy_raw     = d.pop("quota_heavy",     "{}") or "{}"
         grok_4_3_raw  = d.pop("quota_grok_4_3",  "{}") or "{}"
+        build_raw     = d.pop("quota_build",     "{}") or "{}"
         heavy_dict    = json.loads(heavy_raw)
         grok_4_3_dict = json.loads(grok_4_3_raw)
+        build_dict    = json.loads(build_raw)
         d["quota"] = {
             "auto":   json.loads(d.pop("quota_auto",   "{}") or "{}"),
             "fast":   json.loads(d.pop("quota_fast",   "{}") or "{}"),
             "expert": json.loads(d.pop("quota_expert", "{}") or "{}"),
             **({"heavy":    heavy_dict}    if heavy_dict    else {}),
             **({"grok_4_3": grok_4_3_dict} if grok_4_3_dict else {}),
+            **({"build":    build_dict}    if build_dict    else {}),
         }
         d["ext"] = json.loads(d.get("ext") or "{}")
         return AccountRecord.model_validate(d)
@@ -175,7 +180,7 @@ class LocalAccountRepository:
                 f"""
                 INSERT INTO {_TBL} (
                     token, pool, status, created_at, updated_at,
-                    tags, quota_auto, quota_fast, quota_expert, quota_heavy, quota_grok_4_3,
+                    tags, quota_auto, quota_fast, quota_expert, quota_heavy, quota_grok_4_3, quota_build,
                     usage_use_count, usage_fail_count, usage_sync_count,
                     ext, revision
                 ) VALUES (
@@ -262,6 +267,8 @@ class LocalAccountRepository:
                 sets["quota_expert"] = json.dumps(patch.quota_expert)
             if patch.quota_heavy is not None:
                 sets["quota_heavy"] = json.dumps(patch.quota_heavy)
+            if patch.quota_build is not None:
+                sets["quota_build"] = json.dumps(patch.quota_build)
             if patch.quota_grok_4_3 is not None:
                 sets["quota_grok_4_3"] = json.dumps(patch.quota_grok_4_3)
 

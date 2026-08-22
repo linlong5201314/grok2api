@@ -14,10 +14,13 @@ class ModeId(IntEnum):
     EXPERT = 2  # modeId="expert"
     HEAVY = 3  # modeId="heavy"    — only available on heavy-pool accounts
     GROK_4_3 = 4  # modeId="grok-420-computer-use-sa" — super/heavy only
+    BUILD = 5  # modeId="build"    — Grok Build agent mode (verified 2026-08:
+               #   /rest/app-chat accepts modeId="build", same SSE shape as fast)
 
     def to_api_str(self) -> str:
         _OVERRIDES: dict[int, str] = {
             ModeId.GROK_4_3: "grok-420-computer-use-sa",
+            ModeId.BUILD: "build",
         }
         return _OVERRIDES.get(self, self.name.lower())  # type: ignore[arg-type]
 
@@ -62,6 +65,7 @@ ALL_MODES_FULL: tuple[ModeId, ...] = (
     ModeId.EXPERT,
     ModeId.HEAVY,
     ModeId.GROK_4_3,
+    ModeId.BUILD,
 )
 
 __all__ = [

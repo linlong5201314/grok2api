@@ -21,6 +21,7 @@ _MODE_NAMES: dict[int, str] = {
     2: "expert",
     3: "heavy",
     4: "grok-420-computer-use-sa",
+    5: "build",
 }
 
 # Default window durations used as fallback when API call fails.

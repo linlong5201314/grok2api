@@ -43,6 +43,12 @@ MODELS: tuple[ModelSpec, ...] = (
     ModelSpec("grok-4.5-expert",                        ModeId.EXPERT,   Tier.SUPER, Capability.CHAT,       True, "Grok 4.5 Expert",         prefer_best=True),
     ModelSpec("grok-4.5-heavy",                         ModeId.HEAVY,    Tier.HEAVY, Capability.CHAT,       True, "Grok 4.5 Heavy",          prefer_best=True),
 
+    # === grok-build（modeId="build"，2026-08 实测可用）=====================
+    # 上游 web app-chat 直接接受 modeId="build"（Grok Build agent 模式），
+    # SSE 流结构与 fast 完全一致；rate-limits 独立配额（basic 实测 10/10/2h）。
+    # Tier.BASIC + prefer_best：优先重/超池，basic 池账号的 build 配额也可用。
+    ModelSpec("grok-build",                             ModeId.BUILD,    Tier.BASIC, Capability.CHAT,       True, "Grok Build",              prefer_best=True),
+
     # === Image ==============================================================
 
     # Basic fast

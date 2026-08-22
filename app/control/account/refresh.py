@@ -51,6 +51,7 @@ _MODE_KEYS = {
     2: "quota_expert",
     3: "quota_heavy",
     4: "quota_grok_4_3",
+    5: "quota_build",
 }
 
 
