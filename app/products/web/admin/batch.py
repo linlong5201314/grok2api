@@ -247,7 +247,9 @@ async def batch_refresh(
     async def _refresh_one(token: str) -> dict:
         result = await refresh_svc.refresh_tokens([token])
         if not result.refreshed:
-            raise UpstreamError("未获取到真实配额数据")
+            raise UpstreamError(
+                "未获取到真实配额数据（上游接口超时或无响应，请检查代理节点与账号状态）"
+            )
         return {"refreshed": result.refreshed}
 
     c = _concurrency(concurrency, "batch.refresh_concurrency")

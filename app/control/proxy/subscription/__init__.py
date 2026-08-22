@@ -307,6 +307,7 @@ class SubscriptionManager:
                 node.fail_count = old.fail_count
                 node.last_probe_at = old.last_probe_at
                 node.state = old.state
+                node.last_error = old.last_error
             self._nodes[node.node_id] = node
         self._update_stats()
         return len(self._nodes)
@@ -326,6 +327,7 @@ class SubscriptionManager:
                 fail_count=int(raw.get("fail_count", 0)),
                 last_probe_at=raw.get("last_probe_at"),
                 state=NodeState(raw.get("state", "new")),
+                last_error=str(raw.get("last_error", "") or ""),
             )
         except Exception:  # noqa: BLE001
             return None
@@ -506,6 +508,7 @@ class SubscriptionManager:
                     "fail_count": n.fail_count,
                     "last_probe_at": n.last_probe_at,
                     "state": n.state.value,
+                    "last_error": n.last_error,
                 }
                 for nid, n in self._nodes.items()
             },

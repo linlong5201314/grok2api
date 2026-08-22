@@ -126,25 +126,37 @@ async def _do_fetch(token: str, mode_name: str) -> dict:
 
 
 async def _fetch_one(token: str, mode_id: int) -> object | None:
-    """Fetch quota window for a single mode. Returns QuotaWindow or None."""
+    """Fetch quota window for a single mode. Returns QuotaWindow or None.
+
+    Raises ``UpstreamError`` on upstream failures (credential or otherwise) so
+    batch callers can distinguish "account broken" from "Cloudflare/proxy
+    blocked"; single-mode callers wrap this via :func:`fetch_mode_quota`.
+    """
     mode_name = _MODE_NAMES.get(mode_id, "auto")
     try:
         body = await asyncio.wait_for(_do_fetch(token, mode_name), timeout=25.0)
     except asyncio.TimeoutError:
-        logger.debug(
-            "rate-limits fetch timed out: token={}... mode={}", token[:10], mode_name
+        logger.warning(
+            "rate-limits fetch timed out: token={}... mode={}",
+            token[:10],
+            mode_name,
         )
         return None
     except Exception as exc:
         if is_invalid_credentials_error(exc):
             raise
-        logger.debug(
-            "rate-limits fetch failed: token={}... mode={} error={}",
+        status = getattr(exc, "status", None)
+        detail = getattr(exc, "details", {}) or {}
+        body_preview = str(detail.get("body", "") or "")[:200]
+        logger.warning(
+            "rate-limits fetch failed: token={}... mode={} status={} body={} error={}",
             token[:10],
             mode_name,
+            status,
+            body_preview,
             exc,
         )
-        return None
+        raise
 
     data = parse_rate_limits(
         body,
@@ -190,12 +202,30 @@ async def fetch_all_quotas(
         for mode_id, win in zip(requested, results, strict=False)
         if win is not None and not isinstance(win, Exception)
     }
-    return windows if windows else None
+    if windows:
+        return windows
+    # Every requested mode failed.  Surface the first real upstream error
+    # (status + body) so callers can distinguish "account broken" from
+    # "Cloudflare/proxy blocked" instead of silently returning None.
+    for result in results:
+        if isinstance(result, UpstreamError):
+            raise result
+    return None
 
 
 async def fetch_mode_quota(token: str, mode_id: int) -> object | None:
-    """Fetch the quota window for a single mode. Returns QuotaWindow or None."""
-    return await _fetch_one(token, mode_id)
+    """Fetch the quota window for a single mode. Returns QuotaWindow or None.
+
+    Tolerant wrapper: non-credential upstream failures degrade to ``None``
+    (fire-and-forget path); credential failures still propagate so the account
+    can be expired.
+    """
+    try:
+        return await _fetch_one(token, mode_id)
+    except UpstreamError as exc:
+        if is_invalid_credentials_error(exc):
+            raise
+        return None
 
 
 def is_invalid_credentials_body(body: str) -> bool:

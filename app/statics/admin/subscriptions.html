@@ -54,6 +54,7 @@
 
     .state-dot{width:8px;height:8px;border-radius:999px;flex-shrink:0}
     .state-ok{background:var(--success)} .state-bad{background:var(--error)} .state-off{background:#ccc}
+    .node-err{font-size:10px;color:var(--error,#e06c6c);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
     /* 节点表 */
     .table-wrap{overflow-x:auto}
@@ -266,7 +267,7 @@ function renderNodes(data) {
       <td class="lat-cell ${n.latency_ms != null ? latClass(n.latency_ms) : ''}">${lat}</td>
       <td class="lat-cell ${lossPct >= 30 ? 'lat-slow' : ''}">${lossPct}%</td>
       <td><div class="score-bar"><div class="score-fill" style="width:${scorePct}%"></div></div></td>
-      <td>${stateBadge(n.state)}</td>
+      <td>${stateBadge(n.state)}${n.last_error ? `<div class="node-err" title="${esc(n.last_error)}">${esc(n.last_error)}</div>` : ''}</td>
     </tr>`;
   }).join('');
 }

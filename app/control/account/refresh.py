@@ -241,6 +241,18 @@ class AccountRefreshService:
         except UpstreamError as exc:
             if await self._expire_invalid_credentials(record, exc):
                 return RefreshResult(checked=1, expired=1, failed=0)
+            # Non-credential upstream failure (e.g. Cloudflare 403 on the
+            # rate-limits endpoint): scheduled/import paths must stay resilient
+            # and fall back instead of killing the whole batch; the manual
+            # admin path re-raises so the UI shows the real reason.
+            if apply_fallback:
+                logger.debug(
+                    "account quota upstream failure (fallback): token={}... status={} body={}",
+                    record.token[:10],
+                    getattr(exc, "status", None),
+                    str((getattr(exc, "details", {}) or {}).get("body", "") or "")[:200],
+                )
+                return RefreshResult(checked=1, failed=1)
             raise
 
         # API call completely failed — no real data available.

@@ -28,6 +28,43 @@ _DEAD_THRESHOLD = 4   # consecutive failures before a node is marked dead
 _HEALTHY_MS = 900.0   # at or below this TTFB a node counts as healthy
 
 
+def _is_cloudflare_challenge(resp) -> bool:
+    """Detect a Cloudflare bot/challenge response vs a genuine origin answer.
+
+    A challenged egress is unusable for grok.com API traffic even though the
+    TCP tunnel works, so the probe must not count it as a healthy node.
+    """
+    headers = getattr(resp, "headers", None) or {}
+    try:
+        cf_mitigated = str(headers.get("cf-mitigated", "") or "").lower()
+        if "challenge" in cf_mitigated:
+            return True
+        set_cookie = str(headers.get("set-cookie", "") or "").lower()
+        if "cf_chl_" in set_cookie:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    if int(getattr(resp, "status_code", 0) or 0) == 403:
+        try:
+            body = getattr(resp, "content", None)
+            if body:
+                raw = body if isinstance(body, bytes) else str(body)
+                text = raw[:4096]
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", "replace")
+                text = text.lower()
+                if (
+                    "just a moment" in text
+                    or "cf-chl" in text
+                    or "challenge-platform" in text
+                    or "enable javascript" in text
+                ):
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
 @dataclass(slots=True)
 class ProbeOutcome:
     node_id: str
@@ -75,19 +112,41 @@ class NodeSpeedTester:
 
     async def probe(self, node: SubNode) -> ProbeOutcome:
         async with self._semaphore:
-            latency = await self._http_probe(node)
+            latency, http_state = await self._http_probe(node)
+            # A Cloudflare challenge response means the tunnel works but the
+            # egress IP is blocked for grok.com API traffic — do NOT fall back
+            # to a TCP success, otherwise challenged nodes are marked healthy.
+            if http_state == "challenge":
+                self._apply_failure(node)
+                node.last_error = "cloudflare-challenge"
+                return ProbeOutcome(
+                    node.node_id,
+                    ok=False,
+                    error="cloudflare-challenge",
+                )
             if latency is None:
                 latency = await self._tcp_probe(node)
             if latency is None:
                 self._apply_failure(node)
-                return ProbeOutcome(
-                    node.node_id, ok=False, error="tcp+http probe failed"
+                reason = (
+                    f"tcp+http probe failed ({http_state})"
+                    if http_state
+                    else "tcp+http probe failed"
                 )
+                node.last_error = reason
+                return ProbeOutcome(node.node_id, ok=False, error=reason)
+            node.last_error = ""
             self._apply_success(node, latency)
             return ProbeOutcome(node.node_id, ok=True, latency_ms=latency)
 
-    async def _http_probe(self, node: SubNode) -> float | None:
-        """Measure TTFB of *probe_url* through the node's egress URL."""
+    async def _http_probe(self, node: SubNode) -> tuple[float | None, str]:
+        """Measure TTFB of *probe_url* through the node's egress URL.
+
+        Returns ``(ttfb_ms, state)`` where ``state`` is one of:
+          * ``"ok"``        — reachable, not Cloudflare-challenged
+          * ``"challenge"`` — reachable but blocked by a Cloudflare challenge
+          * ``"unreachable"`` — no HTTP response at all
+        """
         from curl_cffi.requests import AsyncSession
 
         t0 = time.perf_counter()
@@ -101,12 +160,13 @@ class NodeSpeedTester:
                 # impersonation adds CPU cost per probe across many nodes.
             )
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            # Any HTTP answer (even 403 from CF) proves the tunnel works.
             if resp.status_code > 0:
-                return elapsed_ms
-            return None
+                if _is_cloudflare_challenge(resp):
+                    return None, "challenge"
+                return elapsed_ms, "ok"
+            return None, "unreachable"
         except Exception:  # noqa: BLE001 — probe failures are expected noise
-            return None
+            return None, "unreachable"
         finally:
             if session is not None:
                 try:

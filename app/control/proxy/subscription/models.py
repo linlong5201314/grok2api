@@ -122,6 +122,7 @@ class SubNode(BaseModel):
     last_probe_at: int | None = None   # ms epoch
     fail_count: int = 0
     ok_count: int = 0
+    last_error: str = ""               # last probe failure reason (display)
 
     @property
     def is_direct(self) -> bool:
