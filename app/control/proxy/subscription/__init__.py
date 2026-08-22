@@ -67,11 +67,23 @@ class SubscriptionManager:
     """Central subscription state; one instance per process."""
 
     def __init__(self) -> None:
+        cfg = get_config()
         self._sources: dict[str, SubscriptionSource] = {}
         self._nodes: dict[str, SubNode] = {}  # node_id -> node
         self._lock = asyncio.Lock()
-        self._tester = NodeSpeedTester()
-        self._core = CoreRunner()
+        # Config must be threaded through here (not left at constructor
+        # defaults) — core_path/max_nodes/speedtest_* are documented knobs and
+        # silently ignoring them leaves the whole subscription mode dead.
+        self._tester = NodeSpeedTester(
+            concurrency=cfg.get_int("proxy.subscription.speedtest_concurrency", 8),
+            timeout_s=cfg.get_float("proxy.subscription.speedtest_timeout_sec", 6.0),
+            probe_url=cfg.get_str("proxy.subscription.probe_url", "https://grok.com/"),
+        )
+        self._core = CoreRunner(
+            binary_path=cfg.get_str("proxy.subscription.core_path", "").strip(),
+            start_port=cfg.get_int("proxy.subscription.core_start_port", 21001),
+            max_nodes=max(1, cfg.get_int("proxy.subscription.max_nodes", 64)),
+        )
         self._refreshing = False
         self._restored_stats: dict[str, dict] = {}
         # account_key -> node_id; survives restarts via the store file.
@@ -359,7 +371,13 @@ class SubscriptionManager:
 
         port_map = await self._core.ensure_running(need_core)
         for node in need_core:
-            if port_map.get(node.node_id):
+            port = port_map.get(node.node_id)
+            if port:
+                # Every fetch rebuilds SubNode objects with egress_url reset,
+                # so ports must be re-applied here on EVERY refresh — even
+                # when the core kept running and ensure_running short-circuited.
+                node.egress_url = f"http://127.0.0.1:{port}"
+                node.local_port = port
                 node.state = NodeState.NEW
             else:
                 # Core unavailable or failed for this node — clear any stale

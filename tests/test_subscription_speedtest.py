@@ -360,3 +360,103 @@ class TestClashCommentAndProvider:
         s = SubNode(protocol=SubProtocol.SOCKS5, server="5.6.7.8", port=1080)
         ob2 = _node_to_outbound(s)
         assert ob2["type"] == "socks"
+
+
+# ---------------------------------------------------------------------------
+# Regression: core port re-application on refresh + config wiring
+# ---------------------------------------------------------------------------
+
+
+def _core_node(node_id: str) -> SubNode:
+    return SubNode(
+        node_id=node_id,
+        protocol=SubProtocol.VMESS,
+        server="svc.example",
+        port=443,
+        credential=f"uuid-{node_id}",
+        source_id="s1",
+    )
+
+
+class TestCorePortReapply:
+    """Every fetch rebuilds SubNode objects with egress_url reset to "".
+    A running sing-box must re-apply its port map on each refresh —
+    otherwise the whole pool silently dies after the second fetch."""
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_reapplies_egress(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from app.control.proxy.subscription.core_runner import CoreRunner
+
+        core = CoreRunner()
+        monkeypatch.setattr(CoreRunner, "resolve_binary", lambda self: "/fake/sing-box")
+        served = _core_node("v1")
+        core._port_map = {"v1": 21001}
+        core._sig = ("/fake/sing-box", (("v1", served.identity()),))
+        core._process = SimpleNamespace(returncode=None)  # healthy running core
+
+        fresh = _core_node("v1")  # re-parsed by the next fetch
+        assert fresh.egress_url == ""
+        port_map = await core.ensure_running([fresh])
+        assert port_map == {"v1": 21001}
+        assert fresh.egress_url == "http://127.0.0.1:21001"
+        assert fresh.local_port == 21001
+
+    @pytest.mark.asyncio
+    async def test_rebuild_egress_uses_returned_port_map(self, monkeypatch):
+        mgr = SubscriptionManager()
+        mgr._merge_nodes("s1", [_core_node("v1")])
+
+        async def fake_ensure(nodes):
+            return {n.node_id: 21007 for n in nodes}
+
+        monkeypatch.setattr(mgr._core, "ensure_running", fake_ensure)
+        await mgr._rebuild_egress()
+        node = mgr._nodes["v1"]
+        assert node.state == NodeState.NEW
+        assert node.egress_url == "http://127.0.0.1:21007"
+        assert node.local_port == 21007
+        assert node.is_usable
+
+
+class TestManagerConfigWiring:
+    """proxy.subscription.* knobs must actually reach CoreRunner/NodeSpeedTester."""
+
+    def test_core_and_tester_receive_config(self, monkeypatch):
+        class _Cfg:
+            def __init__(self, data):
+                self._d = data
+
+            def get_int(self, k, d=0):
+                return self._d.get(k, d)
+
+            def get_float(self, k, d=0.0):
+                return self._d.get(k, d)
+
+            def get_str(self, k, d=""):
+                return self._d.get(k, d)
+
+            def get_bool(self, k, d=False):
+                return self._d.get(k, d)
+
+            def get_list(self, k, d=None):
+                return self._d.get(k, d or [])
+
+        cfg = _Cfg(
+            {
+                "proxy.subscription.core_path": "/opt/sing-box",
+                "proxy.subscription.core_start_port": 31000,
+                "proxy.subscription.max_nodes": 16,
+                "proxy.subscription.speedtest_timeout_sec": 3.5,
+                "proxy.subscription.speedtest_concurrency": 4,
+                "proxy.subscription.probe_url": "https://example.com/ping",
+            }
+        )
+        monkeypatch.setattr(_sub_pkg, "get_config", lambda: cfg)
+        mgr = SubscriptionManager()
+        assert mgr._core._binary_path == "/opt/sing-box"
+        assert mgr._core._start_port == 31000
+        assert mgr._core._max_nodes == 16
+        assert mgr._tester._timeout_s == 3.5
+        assert mgr._tester._probe_url == "https://example.com/ping"

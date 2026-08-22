@@ -52,7 +52,16 @@ class CoreRunner:
     # ------------------------------------------------------------------
 
     def resolve_binary(self) -> str:
-        """Return the sing-box executable path, or '' when unavailable."""
+        """Return the sing-box executable path, or '' when unavailable.
+
+        Re-reads ``proxy.subscription.core_path`` each call so a path set in
+        the admin panel takes effect on the next refresh without a restart.
+        """
+        from app.platform.config.snapshot import get_config
+
+        configured = get_config().get_str("proxy.subscription.core_path", "").strip()
+        if configured:
+            self._binary_path = configured
         if self._binary_path:
             found = shutil.which(self._binary_path)
             if found:
@@ -80,7 +89,12 @@ class CoreRunner:
         Returns ``{node_id: local_port}`` for successfully served nodes.
         """
         binary = self.resolve_binary()
-        targets = [n for n in nodes if n.needs_core][: self._max_nodes]
+        # Sort before truncating: airport node ordering churns between
+        # fetches; a stable order keeps the served set (and thus the restart
+        # signature) stable so a running core is not restarted needlessly.
+        targets = sorted(
+            (n for n in nodes if n.needs_core), key=lambda n: n.node_id
+        )[: self._max_nodes]
         if not targets:
             await self.stop()
             return {}
@@ -92,8 +106,15 @@ class CoreRunner:
             await self.stop()
             return {}
 
-        signature = (binary, tuple(sorted(n.node_id + n.identity() for n in targets)))
+        signature = (binary, tuple(sorted((n.node_id, n.identity()) for n in targets)))
         if self.is_running and signature == getattr(self, "_sig", None):
+            # The core kept running, but callers hand us freshly parsed node
+            # objects whose egress_url was reset — re-apply the port map.
+            for node in targets:
+                port = self._port_map.get(node.node_id)
+                if port:
+                    node.egress_url = f"http://127.0.0.1:{port}"
+                    node.local_port = port
             return dict(self._port_map)
 
         await self.stop()
@@ -184,10 +205,14 @@ class CoreRunner:
             outbound = _node_to_outbound(node)
             if outbound is None:
                 continue
-            while port in used:
+            # Skip past both already-assigned and occupied ports; previously a
+            # single occupied port silently dropped the node from the pool.
+            while port <= 65535 and (port in used or not _port_free(port)):
                 port += 1
-            if not _port_free(port):
-                port += 1
+            if port > 65535:
+                logger.warning(
+                    "no free local port for core node: node={}", node.node_id
+                )
                 continue
             used.add(port)
             in_tag = f"in-{node.node_id}"
@@ -220,9 +245,10 @@ class CoreRunner:
     async def _wait_ports_ready(self, ports: set[int], timeout_s: float = 12.0) -> bool:
         if not ports:
             return False
-        deadline = asyncio.get_event_loop().time() + timeout_s
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
         pending = set(ports)
-        while pending and asyncio.get_event_loop().time() < deadline:
+        while pending and loop.time() < deadline:
             for port in list(pending):
                 if await _tcp_ready(port):
                     pending.discard(port)
