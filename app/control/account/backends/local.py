@@ -185,7 +185,7 @@ class LocalAccountRepository:
                     ext, revision
                 ) VALUES (
                     :token, :pool, 'active', :ts, :ts,
-                    :tags, :qa, :qf, :qe, :qh, :qg,
+                    :tags, :qa, :qf, :qe, :qh, :qg, :qb,
                     0, 0, 0, :ext, :rev
                 )
                 ON CONFLICT(token) DO UPDATE SET
@@ -207,6 +207,7 @@ class LocalAccountRepository:
                     "qe":    json.dumps(qs.expert.to_dict()),
                     "qh":    json.dumps(qs.heavy.to_dict())    if qs.heavy    else "{}",
                     "qg":    json.dumps(qs.grok_4_3.to_dict()) if qs.grok_4_3 else "{}",
+                    "qb":    json.dumps(qs.build.to_dict())    if qs.build    else "{}",
                     "ext":   json.dumps(item.ext),
                     "rev":   revision,
                 },
