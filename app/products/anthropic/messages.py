@@ -318,6 +318,22 @@ async def create(
     # Streaming
     # -------------------------------------------------------------------------
     async def _run_stream() -> AsyncGenerator[str, None]:
+        # message_start must be emitted exactly once per stream, even when the
+        # upstream call is retried with a different account.
+        yield _sse("message_start", {
+            "type": "message_start",
+            "message": {
+                "id":          msg_id,
+                "type":        "message",
+                "role":        "assistant",
+                "model":       model,
+                "content":     [],
+                "stop_reason": None,
+                "usage":       {"input_tokens": estimate_prompt_tokens(internal_message), "output_tokens": 0},
+            },
+        })
+        yield _sse("ping", {"type": "ping"})
+
         excluded: list[str] = []
         for attempt in range(max_retries + 1):
             acct, selected_mode_id = await reserve_account(
@@ -347,21 +363,6 @@ async def create(
 
             try:
                 try:
-                    # message_start
-                    yield _sse("message_start", {
-                        "type": "message_start",
-                        "message": {
-                            "id":          msg_id,
-                            "type":        "message",
-                            "role":        "assistant",
-                            "model":       model,
-                            "content":     [],
-                            "stop_reason": None,
-                            "usage":       {"input_tokens": estimate_prompt_tokens(internal_message), "output_tokens": 0},
-                        },
-                    })
-                    yield _sse("ping", {"type": "ping"})
-
                     ended = False
                     async for line in _stream_chat(
                         token     = token,
@@ -409,7 +410,17 @@ async def create(
                                 # Feed through ToolSieve if tools active
                                 if sieve is not None:
                                     safe_text, calls = sieve.feed(ev.content)
-                                    if calls is not None:
+                                    if calls:
+                                        # Close text block if open — Anthropic protocol
+                                        # forbids starting a new content_block before the
+                                        # previous one received content_block_stop.
+                                        if text_started:
+                                            yield _sse("content_block_stop", {
+                                                "type":  "content_block_stop",
+                                                "index": block_index,
+                                            })
+                                            block_index += 1
+                                            text_started = False
                                         # Emit tool_use blocks
                                         for call in calls:
                                             yield _sse("content_block_start", {
@@ -470,7 +481,21 @@ async def create(
 
                     # Flush sieve — incomplete XML at end of stream
                     if sieve is not None and not tool_calls_emitted:
-                        calls = sieve.flush()
+                        flush_text, calls = sieve.flush()
+                        if flush_text:
+                            if not text_started:
+                                text_started = True
+                                yield _sse("content_block_start", {
+                                    "type":          "content_block_start",
+                                    "index":         block_index,
+                                    "content_block": {"type": "text", "text": ""},
+                                })
+                            text_buf.append(flush_text)
+                            yield _sse("content_block_delta", {
+                                "type":  "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "text_delta", "text": flush_text},
+                            })
                         if calls:
                             # Close text block if open
                             if text_started:

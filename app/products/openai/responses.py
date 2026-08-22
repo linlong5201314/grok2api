@@ -182,7 +182,7 @@ def _parse_input(input_val: str | list) -> list[dict]:
                     normalized.append({"type": "text", "text": part.get("text", "")})
                 elif ptype == "image":
                     src = part.get("image_url") or part.get("source") or {}
-                    url = src.get("url", "")
+                    url = src.get("url", "") if isinstance(src, dict) else str(src or "")
                     if url:
                         normalized.append({"type": "image_url", "image_url": {"url": url}})
                 elif ptype == "input_image":
@@ -193,6 +193,15 @@ def _parse_input(input_val: str | list) -> list[dict]:
                         url = str(src or "")
                     if url:
                         normalized.append({"type": "image_url", "image_url": {"url": url}})
+                elif ptype == "input_file":
+                    # Responses API file part: {"type": "input_file", "file_data": "data:..."}
+                    inner = part.get("file") or {}
+                    data = part.get("file_data") or (
+                        inner.get("file_data") or inner.get("data") or ""
+                        if isinstance(inner, dict) else ""
+                    )
+                    if data:
+                        normalized.append({"type": "file", "file": {"file_data": data}})
                 else:
                     normalized.append(part)
             content = normalized
@@ -367,7 +376,7 @@ async def create(
                                 # Feed through ToolSieve if tools are active
                                 if sieve is not None:
                                     safe_text, calls = sieve.feed(ev.content)
-                                    if calls is not None:
+                                    if calls:
                                         fc_items = _build_fc_items(calls)
                                         detected_fc_items = fc_items
                                         base_idx = 1 if reasoning_started else 0
@@ -431,7 +440,34 @@ async def create(
 
                     # Flush sieve after stream ends (incomplete XML at end of stream)
                     if sieve is not None and not tool_calls_emitted:
-                        calls = sieve.flush()
+                        flush_text, calls = sieve.flush()
+                        if flush_text:
+                            msg_idx = 1 if reasoning_started else 0
+                            if not message_started:
+                                message_started = True
+                                yield format_sse("response.output_item.added", {
+                                    "type":         "response.output_item.added",
+                                    "output_index": msg_idx,
+                                    "item":         {
+                                        "id": message_id, "type": "message",
+                                        "role": "assistant", "content": [], "status": "in_progress",
+                                    },
+                                })
+                                yield format_sse("response.content_part.added", {
+                                    "type":          "response.content_part.added",
+                                    "item_id":       message_id,
+                                    "output_index":  msg_idx,
+                                    "content_index": 0,
+                                    "part":          {"type": "output_text", "text": "", "annotations": []},
+                                })
+                            text_buf.append(flush_text)
+                            yield format_sse("response.output_text.delta", {
+                                "type":          "response.output_text.delta",
+                                "item_id":       message_id,
+                                "output_index":  msg_idx,
+                                "content_index": 0,
+                                "delta":         flush_text,
+                            })
                         if calls:
                             fc_items = _build_fc_items(calls)
                             detected_fc_items = fc_items

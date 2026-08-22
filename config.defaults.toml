@@ -167,6 +167,8 @@ max_inflight = 8
 # ==================== 对话配置 ====================
 [chat]
 timeout = 60
+# 单次请求最多上传的附件数（图片/文件，超出部分丢弃并记日志）
+max_attachments = 8
 
 
 # ==================== 图像配置 ====================
@@ -191,6 +193,10 @@ upload_timeout = 60
 download_timeout = 60
 list_timeout = 60
 delete_timeout = 60
+# 附件（图片/文件）下载超时（秒），用于 URL 形式的输入
+fetch_timeout = 30
+# 单个附件大小上限（字节，0 = 不限制）；URL 与 data URI 输入均生效
+max_upload_bytes = 20971520
 
 
 # ==================== NSFW 操作 ====================

@@ -2,13 +2,23 @@
 
 Calls POST /rest/app-chat/upload-file with base64-encoded content and
 returns the file metadata ID used as a file attachment reference in chat.
+
+Input compatibility matrix (what upload_from_input accepts):
+  - https://... / http://... URLs          (fetched, magic-sniffed, re-uploaded)
+  - data:<mime>;base64,<payload>           (standard data URI)
+  - data:<mime>,<percent-encoded payload>  (non-base64 data URIs, auto-converted)
+  - base64 payloads with whitespace / missing padding (repaired)
+
+Uploads enforce a configurable size cap and retry once on transient
+(5xx / transport) failures so flaky egress doesn't fail the whole request.
 """
 
 import asyncio
 import base64
+import binascii
 import mimetypes
 import re
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import orjson
 
@@ -55,8 +65,46 @@ def _mime_from_name(filename: str, fallback: str = "application/octet-stream") -
     return mime or fallback
 
 
+_MAGIC_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff",          "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n",     "image/png"),
+    (b"GIF87a",                "image/gif"),
+    (b"GIF89a",                "image/gif"),
+    (b"%PDF-",                 "application/pdf"),
+    (b"ID3",                   "audio/mpeg"),
+    (b"\xff\xfb",              "audio/mpeg"),
+    (b"OggS",                  "audio/ogg"),
+)
+
+
+def _sniff_mime(raw: bytes) -> str | None:
+    """Best-effort content-type from magic bytes. None when unknown."""
+    for sig, mime in _MAGIC_SIGNATURES:
+        if raw.startswith(sig):
+            return mime
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+        return "audio/wav"
+    if raw[4:8] == b"ftyp":
+        return "video/mp4"
+    if raw.lstrip().lower().startswith((b"<!doctype html", b"<html")):
+        return "text/html"
+    return None
+
+
+def _repair_b64(b64: str) -> str:
+    """Strip whitespace and restore missing '=' padding."""
+    b64 = re.sub(r"\s+", "", b64)
+    return b64 + "=" * (-len(b64) % 4)
+
+
 def parse_data_uri(data_uri: str) -> tuple[str, str, str]:
     """Split a data URI into (filename, base64_content, mime_type).
+
+    Accepts both ``data:<mime>;base64,<payload>`` and URL-encoded
+    ``data:<mime>,<payload>`` (converted to base64 automatically).
+    Whitespace and missing base64 padding are repaired.
 
     Raises ``ValidationError`` on invalid input.
     """
@@ -64,20 +112,56 @@ def parse_data_uri(data_uri: str) -> tuple[str, str, str]:
         raise ValidationError("File input must be a URL or data URI", param="content")
 
     try:
-        header, b64 = data_uri.split(",", 1)
+        header, payload = data_uri.split(",", 1)
     except ValueError:
         raise ValidationError("Malformed data URI: missing comma separator", param="content")
 
-    if ";base64" not in header:
-        raise ValidationError("Data URI must be base64-encoded", param="content")
-
     mime = header[5:].split(";", 1)[0].strip() or "application/octet-stream"
-    b64  = re.sub(r"\s+", "", b64)
-    if not b64:
-        raise ValidationError("Data URI has empty payload", param="content")
+    ext  = mime.split("/")[-1].split("+", 1)[0] or "bin"
 
-    ext  = mime.split("/")[-1] if "/" in mime else "bin"
-    return f"file.{ext}", b64, mime
+    if ";base64" in header.lower():
+        b64 = _repair_b64(payload)
+        if not b64.rstrip("="):
+            raise ValidationError("Data URI has empty payload", param="content")
+        try:
+            base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValidationError("Data URI payload is not valid base64", param="content")
+        return f"file.{ext}", b64, mime
+
+    # URL-encoded (non-base64) data URI — decode then re-encode.
+    raw = unquote(payload).encode("utf-8", "surrogatepass")
+    if not raw:
+        raise ValidationError("Data URI has empty payload", param="content")
+    return f"file.{ext}", base64.b64encode(raw).decode(), mime
+
+
+def _sanitize_filename(name: str, mime: str) -> str:
+    """Keep a filesystem-safe, length-capped filename with a sane extension."""
+    name = unquote(name or "").strip().strip("/\\")
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", name)
+    if len(name) > 80:
+        name = name[-80:]
+    ext = mimetypes.guess_extension(mime) or (
+        f".{mime.split('/')[-1]}" if "/" in mime else ".bin"
+    )
+    if "." not in name:
+        name = f"{name or 'file'}{ext}"
+    return name
+
+
+def _max_upload_bytes() -> int:
+    return max(0, get_config().get_int("asset.max_upload_bytes", 20 * 1024 * 1024))
+
+
+def _check_size(size: int) -> None:
+    cap = _max_upload_bytes()
+    if cap and size > cap:
+        raise ValidationError(
+            f"Attachment too large: {size} bytes exceeds limit of {cap} bytes "
+            "(asset.max_upload_bytes)",
+            param="content",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -102,10 +186,25 @@ async def upload_file(
         ``(file_id, file_uri)`` — file_id is used as a file attachment ref.
 
     Raises:
-        ``UpstreamError`` on HTTP failure.
+        ``UpstreamError`` on HTTP failure (one retry on 5xx/transport errors).
     """
-    async with _get_upload_sem():
-        return await _upload_file_inner(token, filename, mime, b64)
+    _check_size(len(b64) * 3 // 4)
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            async with _get_upload_sem():
+                return await _upload_file_inner(token, filename, mime, b64)
+        except UpstreamError as exc:
+            transient = exc.status >= 500 or exc.status == 0 or exc.status == 429
+            last_exc = exc
+            if transient and attempt == 0:
+                logger.warning(
+                    "asset upload retrying after transient failure: status={}", exc.status,
+                )
+                await asyncio.sleep(0.5)
+                continue
+            raise
+    raise last_exc  # pragma: no cover — loop always returns or raises
 
 
 async def _upload_file_inner(
@@ -173,8 +272,90 @@ async def _upload_file_inner(
             lease,
             ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR),
         )
-        raise UpstreamError(f"Asset upload transport error: {exc}") from exc
+        raise UpstreamError(f"Asset upload transport error: {exc}", status=0) from exc
 
+
+# ---------------------------------------------------------------------------
+# URL fetch
+# ---------------------------------------------------------------------------
+
+async def _fetch_url_bytes(token: str, file_input: str) -> tuple[bytes, str, str]:
+    """Fetch a remote file. Returns (raw_bytes, mime, filename)."""
+    cfg      = get_config()
+    timeout  = cfg.get_float("asset.fetch_timeout", 30.0)
+    proxy    = await get_proxy_runtime()
+    lease    = await proxy.acquire(affinity_key=token)
+
+    headers = build_http_headers(token, lease=lease)
+    kwargs  = build_session_kwargs(lease=lease)
+
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            async with ResettableSession(**kwargs) as session:
+                resp = await session.get(file_input, headers=headers, timeout=timeout)
+            break
+        except UpstreamError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR))
+            if attempt == 0:
+                logger.warning("asset url fetch retrying after transport error: {}", exc)
+                await asyncio.sleep(0.5)
+                continue
+            raise UpstreamError(f"Asset fetch transport error: {exc}", status=0) from exc
+    else:  # pragma: no cover
+        raise last_exc
+
+    raw = resp.content
+    if resp.status_code != 200:
+        await proxy.feedback(
+            lease,
+            ProxyFeedback(
+                kind        = ProxyFeedbackKind.UPSTREAM_5XX if resp.status_code >= 500
+                              else ProxyFeedbackKind.FORBIDDEN,
+                status_code = resp.status_code,
+            ),
+        )
+        raise UpstreamError(
+            f"Failed to fetch input URL: {resp.status_code}",
+            status = resp.status_code,
+        )
+    if not raw:
+        await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS))
+        raise ValidationError("Input URL returned an empty file", param="content")
+
+    declared_mime = (resp.headers.get("content-type", "").split(";")[0].strip()
+                     or "application/octet-stream")
+    sniffed = _sniff_mime(raw)
+
+    # An HTML body means we were served a page (auth wall / error), not a file.
+    if sniffed == "text/html":
+        await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS))
+        raise ValidationError(
+            "Input URL points to an HTML page, not a downloadable file", param="content",
+        )
+
+    if sniffed and (declared_mime in ("application/octet-stream", "text/plain")
+                    or sniffed.split("/")[0] != declared_mime.split("/")[0]):
+        if sniffed != declared_mime:
+            logger.debug(
+                "asset mime corrected by magic bytes: declared={} sniffed={}",
+                declared_mime, sniffed,
+            )
+        mime = sniffed
+    else:
+        mime = declared_mime
+
+    filename = file_input.split("/")[-1].split("?")[0]
+    await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS))
+    return raw, mime, filename
+
+
+# ---------------------------------------------------------------------------
+# High-level entry
+# ---------------------------------------------------------------------------
 
 async def upload_from_input(token: str, file_input: str) -> tuple[str, str]:
     """High-level helper: parse *file_input* (URL or data URI) and upload.
@@ -182,39 +363,10 @@ async def upload_from_input(token: str, file_input: str) -> tuple[str, str]:
     Returns ``(file_id, file_uri)``.
     """
     if _is_url(file_input):
-        # Fetch the remote URL and re-upload as base64.
-        proxy = await get_proxy_runtime()
-        lease = await proxy.acquire(affinity_key=token)
-        try:
-            headers = build_http_headers(token, lease=lease)
-            kwargs  = build_session_kwargs(lease=lease)
-            async with ResettableSession(**kwargs) as session:
-                resp = await session.get(file_input, headers=headers, timeout=30.0)
-            raw  = resp.content
-            if resp.status_code != 200:
-                await proxy.feedback(
-                    lease,
-                    ProxyFeedback(
-                        kind        = ProxyFeedbackKind.UPSTREAM_5XX if resp.status_code >= 500
-                                      else ProxyFeedbackKind.FORBIDDEN,
-                        status_code = resp.status_code,
-                    ),
-                )
-                raise UpstreamError(
-                    f"Failed to fetch input URL: {resp.status_code}",
-                    status = resp.status_code,
-                )
-            mime     = (resp.headers.get("content-type", "").split(";")[0].strip()
-                        or "application/octet-stream")
-            filename = file_input.split("/")[-1].split("?")[0] or "download"
-            b64      = base64.b64encode(raw).decode()
-        except UpstreamError:
-            raise
-        except Exception as exc:
-            await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR))
-            raise UpstreamError(f"Asset fetch transport error: {exc}") from exc
-
-        await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS))
+        raw, mime, filename = await _fetch_url_bytes(token, file_input)
+        _check_size(len(raw))
+        filename = _sanitize_filename(filename, mime)
+        b64      = base64.b64encode(raw).decode()
         return await upload_file(token, filename, mime, b64)
 
     # Data URI
