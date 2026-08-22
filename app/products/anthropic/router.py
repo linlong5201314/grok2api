@@ -91,7 +91,8 @@ async def messages_endpoint(req: MessagesRequest):
         raise ValidationError("messages cannot be empty", param="messages")
 
     cfg       = get_config()
-    is_stream = req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
+    # Anthropic 兼容标准：未传 stream 时默认非流式 JSON。
+    is_stream = bool(req.stream) if req.stream is not None else False
 
     # thinking flag: enable when request has thinking config or config default
     if req.thinking is not None and isinstance(req.thinking, dict):

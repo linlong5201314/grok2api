@@ -218,9 +218,11 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
     from app.platform.config.snapshot import get_config
 
     cfg = get_config()
-    is_stream = (
-        req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
-    )
+    # OpenAI 兼容标准：客户端未传 stream 时默认为非流式 JSON 响应。
+    # 之前默认跟随 features.stream(true)，导致不传 stream 的客户端
+    # （如 one-api / new-api 的渠道连接测试）收到 SSE 流 "data: {...}"，
+    # Go JSON 解析报 "invalid character 'd' looking for beginning of value"。
+    is_stream = bool(req.stream) if req.stream is not None else False
 
     spec = model_registry.get(req.model)
     if spec is None:
@@ -389,9 +391,8 @@ async def responses_endpoint(req: ResponsesCreateRequest):
         raise _ValidationError("input cannot be empty", param="input")
 
     cfg = get_config()
-    is_stream = (
-        req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
-    )
+    # 同 /v1/chat/completions：未传 stream 时默认非流式 JSON（OpenAI 标准）。
+    is_stream = bool(req.stream) if req.stream is not None else False
 
     # Map reasoning param → emit_think flag.
     # reasoning=None → use config; reasoning.effort="none" → off; otherwise on.

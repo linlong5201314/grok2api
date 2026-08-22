@@ -298,6 +298,62 @@ def _strip_generated_artifacts(text: str, *, strip_sources: bool = False) -> str
     return text.strip()
 
 
+def _extract_text_from_content(content: Any) -> str:
+    """Extract plain text from message content that may be a string or a
+    list of content parts (tool results / assistant text parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                if block.strip():
+                    parts.append(block)
+            elif isinstance(block, dict) and block.get("type") in ("text", "input_text", "output_text"):
+                text = (block.get("text") or "").strip()
+                if text:
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def _extract_file_ref(block: dict) -> str:
+    """Pull an uploadable file reference (URL / data URI / raw base64) out of
+    a multimodal content part, tolerating the shapes different SDKs emit."""
+    btype = block.get("type")
+
+    if btype == "image_url":
+        inner = block.get("image_url")
+        if isinstance(inner, str):                    # non-standard plain-string form
+            return inner
+        if isinstance(inner, dict):
+            return inner.get("url") or inner.get("data") or ""
+        return ""
+
+    if btype in ("input_audio",):
+        inner = block.get(btype) or {}
+        return (inner.get("data") or inner.get("file_data") or "") if isinstance(inner, dict) else ""
+
+    if btype in ("file", "input_file"):
+        # file_data may live at the block level (Responses API) or nested.
+        data = block.get("file_data") or ""
+        if data:
+            return data
+        inner = block.get(btype) or block.get("file") or {}
+        if isinstance(inner, dict):
+            data = inner.get("file_data") or inner.get("data") or ""
+            if data:
+                return data
+            url = inner.get("url") or ""
+            if url:
+                return url
+        elif isinstance(inner, str):
+            return inner
+        return ""
+
+    return ""
+
+
 def _extract_message(messages: list[dict]) -> tuple[str, list[str]]:
     """Flatten OpenAI messages into a single prompt string + file attachments."""
     parts: list[str] = []
@@ -314,7 +370,7 @@ def _extract_message(messages: list[dict]) -> tuple[str, list[str]]:
             label = (
                 f"[tool result for {tool_call_id}]" if tool_call_id else "[tool result]"
             )
-            text = content.strip() if isinstance(content, str) else ""
+            text = _extract_text_from_content(content).strip()
             if text:
                 parts.append(f"{label}:\n{text}")
             continue
@@ -323,7 +379,7 @@ def _extract_message(messages: list[dict]) -> tuple[str, list[str]]:
         if role == "assistant" and tool_calls:
             xml = tool_calls_to_xml(tool_calls)
             # Prepend any accompanying text content (rare but valid)
-            text = content.strip() if isinstance(content, str) else ""
+            text = _extract_text_from_content(content).strip()
             if text:
                 parts.append(f"[assistant]: {text}\n{xml}")
             else:
@@ -342,9 +398,11 @@ def _extract_message(messages: list[dict]) -> tuple[str, list[str]]:
         elif isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
+                    if isinstance(block, str) and block.strip():
+                        parts.append(f"[{role}]: {block}")
                     continue
                 btype = block.get("type")
-                if btype == "text":
+                if btype in ("text", "input_text", "output_text"):
                     text = block.get("text") or ""
                     text = _strip_generated_artifacts(
                         text.strip(),
@@ -352,29 +410,56 @@ def _extract_message(messages: list[dict]) -> tuple[str, list[str]]:
                     )
                     if text:
                         parts.append(f"[{role}]: {text}")
-                elif btype == "image_url":
-                    url = (block.get("image_url") or {}).get("url", "")
-                    if url:
-                        files.append(url)
-                elif btype in ("input_audio", "file"):
-                    inner = block.get(btype) or {}
-                    data = inner.get("data") or inner.get("file_data", "")
-                    if data:
-                        files.append(data)
+                else:
+                    file_ref = _extract_file_ref(block)
+                    if file_ref:
+                        files.append(file_ref)
 
     return "\n\n".join(parts), files
 
 
 async def _prepare_file_attachments(token: str, file_inputs: list[str]) -> list[str]:
-    """Upload OpenAI-style multimodal inputs and return Grok chat attachment IDs."""
-    attachments: list[str] = []
+    """Upload OpenAI-style multimodal inputs and return Grok chat attachment IDs.
+
+    Deduplicates identical inputs, caps the attachment count, and uploads in
+    parallel (order preserved). A failed upload aborts the request with the
+    offending file index instead of silently dropping the attachment.
+    """
+    if not file_inputs:
+        return []
+
+    cfg = get_config()
+    max_attachments = cfg.get_int("chat.max_attachments", 8)
+
+    seen: set[str] = set()
+    unique: list[str] = []
     for file_input in file_inputs:
-        if not file_input:
+        if not file_input or file_input in seen:
             continue
-        file_id, _file_uri = await upload_from_input(token, file_input)
-        if file_id:
-            attachments.append(file_id)
-    return attachments
+        seen.add(file_input)
+        unique.append(file_input)
+
+    if len(unique) > max_attachments:
+        logger.warning(
+            "attachment count capped: requested={} kept={}",
+            len(unique), max_attachments,
+        )
+        unique = unique[:max_attachments]
+
+    async def _upload_one(idx: int, file_input: str) -> str:
+        try:
+            file_id, _uri = await upload_from_input(token, file_input)
+        except UpstreamError as exc:
+            raise UpstreamError(
+                f"Attachment {idx + 1} upload failed: {exc.message}",
+                status=exc.status, body=exc.details.get("body", ""),
+            ) from exc
+        return file_id
+
+    results = await asyncio.gather(*[
+        _upload_one(i, fi) for i, fi in enumerate(unique)
+    ])
+    return [fid for fid in results if fid]
 
 
 async def _stream_chat(
@@ -466,9 +551,13 @@ async def completions(
     """
     cfg = get_config()
     spec = resolve_model(model)
-    is_stream = stream if stream is not None else cfg.get_bool("features.stream", True)
+    # OpenAI 兼容标准：未显式传 stream 时默认为非流式 JSON。
+    is_stream = bool(stream) if stream is not None else False
     if emit_think is None:
         emit_think = cfg.get_bool("features.thinking", True)
+    # Validate image format up front so a bad config fails as a clean 400
+    # instead of breaking the stream after generation started.
+    _normalize_image_format(cfg.get_str("features.image_format", "grok_url"))
 
     logger.info(
         "chat request accepted: model={} stream={} message_count={}",
@@ -553,7 +642,7 @@ async def completions(
                                                 response_id, model, safe_text
                                             )
                                             yield f"data: {orjson.dumps(chunk).decode()}\n\n"
-                                        if parsed_calls is not None:
+                                        if parsed_calls:
                                             for i, tc in enumerate(parsed_calls):
                                                 chunk = make_tool_call_chunk(
                                                     response_id,
@@ -601,7 +690,12 @@ async def completions(
 
                         if not tool_calls_emitted and tool_names:
                             # Stream ended — flush sieve for any buffered XML
-                            flushed_calls = sieve.flush()
+                            flushed_text, flushed_calls = sieve.flush()
+                            if flushed_text:
+                                chunk = make_stream_chunk(
+                                    response_id, model, flushed_text
+                                )
+                                yield f"data: {orjson.dumps(chunk).decode()}\n\n"
                             if flushed_calls:
                                 for i, tc in enumerate(flushed_calls):
                                     chunk = make_tool_call_chunk(
