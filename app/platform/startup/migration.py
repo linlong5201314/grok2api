@@ -55,6 +55,7 @@ async def run_startup_migrations(
     await _migrate_basic_refresh_interval(config_backend)
     await _migrate_accounts(account_repo)
     await _backfill_grok_4_3_quota(account_repo)
+    await _backfill_build_quota(account_repo)
     await _normalize_basic_fast_only_quota(account_repo)
 
 
@@ -247,6 +248,45 @@ async def _backfill_grok_4_3_quota(repo: "AccountRepository") -> None:
         res = await repo.patch_accounts(batch)
         total += res.patched
     logger.info("account: backfilled quota_grok_4_3 for {} super/heavy accounts", total)
+
+
+# ---------------------------------------------------------------------------
+# Backfill quota_build for accounts imported before the field existed.
+# Every pool has a default build window (basic 10, super 30, heavy 50 per 2h);
+# without it the runtime index never contains mode 5 and grok-build requests
+# fail with "No available accounts for this model tier" (429).
+# ---------------------------------------------------------------------------
+
+async def _backfill_build_quota(repo: "AccountRepository") -> None:
+    from app.control.account.commands import AccountPatch, ListAccountsQuery
+    from app.control.account.quota_defaults import default_quota_window
+
+    patches: list[AccountPatch] = []
+    page = 1
+    while True:
+        result = await repo.list_accounts(
+            ListAccountsQuery(page=page, page_size=_BATCH, include_deleted=False)
+        )
+        for record in result.items:
+            if record.quota_set().build is not None:
+                continue
+            window = default_quota_window(record.pool, 5)
+            if window is None:
+                continue
+            patches.append(AccountPatch(token=record.token, quota_build=window.to_dict()))
+        if page >= result.total_pages:
+            break
+        page += 1
+
+    if not patches:
+        return
+
+    total = 0
+    for i in range(0, len(patches), _BATCH):
+        batch = patches[i : i + _BATCH]
+        res = await repo.patch_accounts(batch)
+        total += res.patched
+    logger.info("account: backfilled quota_build for {} accounts", total)
 
 
 async def _normalize_basic_fast_only_quota(repo: "AccountRepository") -> None:
