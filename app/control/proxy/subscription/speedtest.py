@@ -140,12 +140,18 @@ class NodeSpeedTester:
             return ProbeOutcome(node.node_id, ok=True, latency_ms=latency)
 
     async def _http_probe(self, node: SubNode) -> tuple[float | None, str]:
-        """Measure TTFB of *probe_url* through the node's egress URL.
+        """Measure TTFB through the node's egress URL.
 
         Returns ``(ttfb_ms, state)`` where ``state`` is one of:
           * ``"ok"``        — reachable, not Cloudflare-challenged
           * ``"challenge"`` — reachable but blocked by a Cloudflare challenge
           * ``"unreachable"`` — no HTTP response at all
+
+        With the default probe URL the probe POSTs the grok rate-limits
+        endpoint using bogus credentials: a 401 (bad credentials) proves the
+        node passed Cloudflare and reached the grok origin — the exact
+        usability signal production traffic depends on — while a 403
+        challenge page marks the egress IP as blocked.
         """
         from curl_cffi.requests import AsyncSession
 
@@ -153,15 +159,40 @@ class NodeSpeedTester:
         session: AsyncSession | None = None
         try:
             session = AsyncSession(proxy=node.egress_url, timeout=self._timeout_s)
-            resp = await session.head(
-                self._probe_url,
-                allow_redirects=False,
-                # A plain HEAD without impersonation is enough for latency;
-                # impersonation adds CPU cost per probe across many nodes.
-            )
+            is_default_probe = self._probe_url.rstrip("/") == "https://grok.com"
+            if is_default_probe:
+                resp = await session.post(
+                    "https://grok.com/rest/rate-limits",
+                    headers={
+                        "Accept": "*/*",
+                        "Content-Type": "application/json",
+                        "Origin": "https://grok.com",
+                        "Referer": "https://grok.com/",
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/136.0.0.0 Safari/537.36"
+                        ),
+                        "Cookie": "sso=probe-invalid; sso-rw=probe-invalid",
+                    },
+                    data=b'{"modelName":"fast"}',
+                    allow_redirects=False,
+                )
+            else:
+                resp = await session.head(
+                    self._probe_url,
+                    allow_redirects=False,
+                    # A plain HEAD without impersonation is enough for latency;
+                    # impersonation adds CPU cost per probe across many nodes.
+                )
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             if resp.status_code > 0:
                 if _is_cloudflare_challenge(resp):
+                    return None, "challenge"
+                # grok.com only ever answers 401 (bad credentials) to the
+                # probe; any other 403 on the rate-limits endpoint is a
+                # Cloudflare / geo block, not an auth answer.
+                if is_default_probe and resp.status_code == 403:
                     return None, "challenge"
                 return elapsed_ms, "ok"
             return None, "unreachable"

@@ -118,8 +118,11 @@ async def post_json(
                 response.status_code,
                 body_text,
             )
+            # Keep the raised message short — it surfaces in admin toasts —
+            # while the full preview stays in ``details["body"]``.
+            snippet = body_text[:160].replace("\n", " ").replace("\r", "")
             raise UpstreamError(
-                f"Upstream returned {response.status_code}: {body_text}",
+                f"Upstream returned {response.status_code}: {snippet}",
                 status=response.status_code,
                 body=body_text,
             )
