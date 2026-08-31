@@ -179,12 +179,30 @@ def _local_image_url(file_id: str) -> str:
     return f"{app_url}/v1/files/image?id={file_id}"
 
 
+# Generic path segments that must never be used as a file id stem.
+_GENERIC_URL_SEGMENTS = {
+    "image", "images", "original", "thumbnail", "content",
+    "generated", "users", "uploads", "attachments",
+}
+
+# Must match the /v1/files/image serve-route pattern ([0-9a-f-]{16,36}).
+_ASSET_ID_RE = re.compile(r"[0-9a-fA-F\-]{16,36}")
+
+
 def _extract_image_file_id(url: str) -> str:
+    """Derive a stable, serve-compatible file id from an upstream asset URL.
+
+    Asset URLs ending in a generic segment (e.g. ``.../{asset_id}/content``)
+    previously collapsed every download onto the same file id — all edit
+    images overwrote one ``content.jpg`` and the id was rejected by the
+    serve route. Prefer the last hex/uuid-like segment; otherwise fall back
+    to a sha1 of the full URL, which stays unique per URL.
+    """
     parts = [part for part in url.split("/") if part]
     for part in reversed(parts):
         stem = part.split(".", 1)[0]
-        if stem and stem not in {"image", "original", "thumbnail"}:
-            return stem
+        if stem and stem not in _GENERIC_URL_SEGMENTS and _ASSET_ID_RE.fullmatch(stem):
+            return stem.lower()
     return hashlib.sha1(url.encode("utf-8")).hexdigest()[:32]
 
 

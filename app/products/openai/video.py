@@ -21,6 +21,7 @@ from app.platform.config.snapshot import get_config
 from app.platform.errors import (
     AppError,
     ErrorKind,
+    NotFoundError,
     RateLimitError,
     UpstreamError,
     ValidationError,
@@ -966,14 +967,14 @@ async def create_video(
 async def retrieve(video_id: str) -> dict[str, Any]:
     job = await get_video_job(video_id)
     if job is None:
-        raise ValidationError(f"Video {video_id!r} not found", param="video_id")
+        raise NotFoundError(f"Video {video_id!r} not found", param="video_id")
     return job.to_dict()
 
 
 async def content_path(video_id: str) -> Path:
     job = await get_video_job(video_id)
     if job is None:
-        raise ValidationError(f"Video {video_id!r} not found", param="video_id")
+        raise NotFoundError(f"Video {video_id!r} not found", param="video_id")
     if job.status != "completed" or not job.content_path:
         raise AppError(
             "Video content is not ready yet",
@@ -983,7 +984,7 @@ async def content_path(video_id: str) -> Path:
         )
     path = Path(job.content_path)
     if not path.exists():
-        raise ValidationError(
+        raise NotFoundError(
             f"Video content for {video_id!r} not found", param="video_id"
         )
     return path

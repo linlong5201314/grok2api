@@ -26,10 +26,7 @@ from app.control.account.enums import FeedbackKind
 from app.dataplane.account.selector import current_strategy
 from app.dataplane.proxy.adapters.headers import build_http_headers
 from app.dataplane.proxy import get_proxy_runtime
-from app.dataplane.proxy.adapters.session import (
-    ResettableSession,
-    build_session_kwargs,
-)
+from app.dataplane.proxy.adapters.session import get_session_pool
 from app.dataplane.reverse.protocol.xai_chat import (
     build_chat_payload,
     classify_line,
@@ -283,6 +280,39 @@ def _normalize_image_format(value: str | None) -> str:
     return fmt
 
 
+_JSON_ONLY_INSTRUCTION = (
+    "\n\n[SYSTEM INSTRUCTION] Respond with a single valid JSON value and "
+    "nothing else. Do not wrap the JSON in markdown code fences and do not "
+    "add any commentary before or after it."
+)
+
+
+def _apply_response_format(message: str, response_format: Any) -> str:
+    """Best-effort ``response_format`` support (json_object / json_schema).
+
+    Grok's web endpoint has no structured-output switch, so the constraint
+    is enforced via a prompt instruction appended after any tool prompt.
+    """
+    if not isinstance(response_format, dict):
+        return message
+    rtype = response_format.get("type")
+    if rtype == "json_object":
+        return message + _JSON_ONLY_INSTRUCTION
+    if rtype == "json_schema":
+        instruction = _JSON_ONLY_INSTRUCTION
+        schema = (response_format.get("json_schema") or {}).get("schema")
+        if schema:
+            try:
+                instruction += (
+                    "\nThe JSON must conform to this JSON Schema:\n"
+                    + orjson.dumps(schema).decode()
+                )
+            except (TypeError, ValueError):
+                pass
+        return message + instruction
+    return message
+
+
 # 精确匹配 grok2api 注入的 Sources 段落（含标记行），用于多轮对话剥离
 _SOURCES_STRIP_RE = re.compile(
     r"(?:^|\r?\n\r?\n)## Sources\r?\n\[grok2api-sources\]: #\r?\n[\s\S]*$"
@@ -462,6 +492,41 @@ async def _prepare_file_attachments(token: str, file_inputs: list[str]) -> list[
     return [fid for fid in results if fid]
 
 
+async def _proxy_feedback_safe(proxy, lease, exc: BaseException | None) -> None:
+    """Best-effort proxy feedback for the chat hot path.
+
+    Proxy node health / clearance rotation is feedback-driven; without this
+    the largest traffic source (chat) is invisible to node scoring and bad
+    egress nodes are never rotated. Client-side cancellations
+    (GeneratorExit / CancelledError) are ignored — they say nothing about
+    proxy health.
+    """
+    from app.control.proxy.models import ProxyFeedback, ProxyFeedbackKind
+
+    if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+        return
+    try:
+        if exc is None:
+            await proxy.feedback(
+                lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS, status_code=200)
+            )
+            return
+        status = getattr(exc, "status", None)
+        if status == 429:
+            kind = ProxyFeedbackKind.RATE_LIMITED
+        elif status == 403:
+            kind = ProxyFeedbackKind.CHALLENGE
+        elif status == 401:
+            kind = ProxyFeedbackKind.UNAUTHORIZED
+        elif status and status >= 500:
+            kind = ProxyFeedbackKind.UPSTREAM_5XX
+        else:
+            kind = ProxyFeedbackKind.TRANSPORT_ERROR
+        await proxy.feedback(lease, ProxyFeedback(kind=kind, status_code=status))
+    except Exception as feedback_exc:
+        logger.debug("chat proxy feedback failed (non-fatal): error={}", feedback_exc)
+
+
 async def _stream_chat(
     token: str,
     mode_id: "ModeId",
@@ -495,40 +560,75 @@ async def _stream_chat(
         referer="https://grok.com/",
         lease=lease,
     )
-    session_kwargs = build_session_kwargs(lease=lease)
 
-    async with ResettableSession(**session_kwargs) as session:
-        try:
-            response = await session.post(
-                CHAT,
-                headers=headers,
-                data=payload_bytes,
-                timeout=timeout_s,
-                stream=True,
-            )
-        except Exception as exc:
-            raise _transport_upstream_error(
-                exc, context="Chat transport failed"
-            ) from exc
-
-        if response.status_code != 200:
+    pool = get_session_pool()
+    pooled = await pool.acquire(lease=lease)
+    stream_exc: BaseException | None = None
+    completed = False
+    try:
+        async with pooled as session:
             try:
-                body = response.content.decode("utf-8", "replace")[:400]
-            except Exception:
-                body = ""
-            raise UpstreamError(
-                f"Chat upstream returned {response.status_code}",
-                status=response.status_code,
-                body=body,
-            )
+                # No curl-level total timeout: it would abort long-lived
+                # streams mid-generation. The connect/headers phase is
+                # bounded below, and the read loop enforces a per-line idle
+                # timeout instead.
+                response = await asyncio.wait_for(
+                    session.post(
+                        CHAT,
+                        headers=headers,
+                        data=payload_bytes,
+                        stream=True,
+                    ),
+                    timeout=timeout_s,
+                )
+            except asyncio.TimeoutError as exc:
+                pooled.discard()
+                raise _transport_upstream_error(
+                    TimeoutError(f"no response headers within {timeout_s:.0f}s"),
+                    context="Chat transport failed",
+                ) from exc
+            except Exception as exc:
+                raise _transport_upstream_error(
+                    exc, context="Chat transport failed"
+                ) from exc
 
-        try:
-            async for line in response.aiter_lines():
-                yield line
-        except Exception as exc:
-            raise _transport_upstream_error(
-                exc, context="Chat stream read failed"
-            ) from exc
+            if response.status_code != 200:
+                try:
+                    body = response.content.decode("utf-8", "replace")[:400]
+                except Exception:
+                    body = ""
+                raise UpstreamError(
+                    f"Chat upstream returned {response.status_code}",
+                    status=response.status_code,
+                    body=body,
+                )
+
+            try:
+                iterator = response.aiter_lines()
+                while True:
+                    try:
+                        line = await asyncio.wait_for(
+                            anext(iterator), timeout=timeout_s
+                        )
+                    except StopAsyncIteration:
+                        break
+                    yield line
+            except asyncio.TimeoutError as exc:
+                pooled.discard()
+                raise _transport_upstream_error(
+                    TimeoutError(f"stream idle for {timeout_s:.0f}s"),
+                    context="Chat stream read failed",
+                ) from exc
+            except Exception as exc:
+                raise _transport_upstream_error(
+                    exc, context="Chat stream read failed"
+                ) from exc
+        completed = True
+    except BaseException as exc:
+        stream_exc = exc
+        raise
+    finally:
+        await _proxy_feedback_safe(proxy, lease, None if completed else stream_exc)
 
 
 async def completions(
@@ -542,6 +642,8 @@ async def completions(
     temperature: float = 0.8,
     top_p: float = 0.95,
     request_overrides: dict | None = None,
+    stream_options: dict | None = None,
+    response_format: dict | None = None,
 ) -> dict | AsyncGenerator[str, None]:
     """Entry point for /v1/chat/completions.
 
@@ -588,12 +690,20 @@ async def completions(
         tool_prompt = build_tool_system_prompt(tools, tool_choice)
         message = inject_into_message(message, tool_prompt)
     tool_overrides: dict | None = None
+    message = _apply_response_format(message, response_format)
 
     # ── Streaming path ────────────────────────────────────────────────────────
     if is_stream:
 
         async def _run_stream() -> AsyncGenerator[str, None]:
             excluded: list[str] = []
+            # Once any client-visible delta has been yielded we must not retry
+            # with a fresh attempt: the client already received attempt-N
+            # content and a retry would duplicate it.
+            emitted_any = False
+            include_usage = isinstance(stream_options, dict) and bool(
+                stream_options.get("include_usage")
+            )
             for attempt in range(max_retries + 1):
                 acct, selected_mode_id = await reserve_account(
                     directory,
@@ -641,6 +751,7 @@ async def completions(
                                             chunk = make_stream_chunk(
                                                 response_id, model, safe_text
                                             )
+                                            emitted_any = True
                                             yield f"data: {orjson.dumps(chunk).decode()}\n\n"
                                         if parsed_calls:
                                             for i, tc in enumerate(parsed_calls):
@@ -653,6 +764,7 @@ async def completions(
                                                     tc.arguments,
                                                     is_first=True,
                                                 )
+                                                emitted_any = True
                                                 yield f"data: {orjson.dumps(chunk).decode()}\n\n"
                                             done_chunk = make_tool_call_done_chunk(
                                                 response_id, model
@@ -674,11 +786,13 @@ async def completions(
                                         chunk = make_stream_chunk(
                                             response_id, model, ev.content
                                         )
+                                        emitted_any = True
                                         yield f"data: {orjson.dumps(chunk).decode()}\n\n"
                                 elif ev.kind == "thinking" and emit_think:
                                     chunk = make_thinking_chunk(
                                         response_id, model, ev.content
                                     )
+                                    emitted_any = True
                                     yield f"data: {orjson.dumps(chunk).decode()}\n\n"
                                 elif ev.kind == "annotation" and ev.annotation_data:
                                     collected_annotations.append(ev.annotation_data)
@@ -695,6 +809,7 @@ async def completions(
                                 chunk = make_stream_chunk(
                                     response_id, model, flushed_text
                                 )
+                                emitted_any = True
                                 yield f"data: {orjson.dumps(chunk).decode()}\n\n"
                             if flushed_calls:
                                 for i, tc in enumerate(flushed_calls):
@@ -707,6 +822,7 @@ async def completions(
                                         tc.arguments,
                                         is_first=True,
                                     )
+                                    emitted_any = True
                                     yield f"data: {orjson.dumps(chunk).decode()}\n\n"
                                 done_chunk = make_tool_call_done_chunk(
                                     response_id, model
@@ -731,6 +847,7 @@ async def completions(
                                 chunk = make_stream_chunk(
                                     response_id, model, img_text + "\n"
                                 )
+                                emitted_any = True
                                 yield f"data: {orjson.dumps(chunk).decode()}\n\n"
 
                             references = adapter.references_suffix()
@@ -738,6 +855,7 @@ async def completions(
                                 chunk = make_stream_chunk(
                                     response_id, model, references
                                 )
+                                emitted_any = True
                                 yield f"data: {orjson.dumps(chunk).decode()}\n\n"
 
                             chat_anns = _to_chat_annotations(collected_annotations)
@@ -752,6 +870,13 @@ async def completions(
                             sources = adapter.search_sources_list()
                             if sources:
                                 final["search_sources"] = sources
+                            if include_usage:
+                                streamed_text = "".join(adapter.text_buf)
+                                streamed_think = "".join(adapter.thinking_buf)
+                                pt = estimate_prompt_tokens(message)
+                                ct = estimate_tokens(streamed_text)
+                                rt = estimate_tokens(streamed_think) if streamed_think else 0
+                                final["usage"] = build_usage(pt, ct + rt, reasoning_tokens=rt)
                             yield f"data: {orjson.dumps(final).decode()}\n\n"
                             yield "data: [DONE]\n\n"
                             success = True
@@ -768,6 +893,7 @@ async def completions(
                         if (
                             _should_retry_upstream(exc, retry_codes)
                             and attempt < max_retries
+                            and not emitted_any
                         ):
                             _retry = True
                             logger.warning(

@@ -98,6 +98,26 @@ def _to_quota_window(data: dict, synced_at: int) -> object:
 # HTTP fetch
 # ---------------------------------------------------------------------------
 
+# Global cap on concurrent rate-limits requests. The refresh scheduler runs
+# up to `usage_concurrency` accounts in parallel and each account probes all
+# its modes at once — without this semaphore a 50-account pool generates
+# 250 simultaneous upstream calls, which is exactly the kind of burst that
+# gets an egress IP rate-limited or Cloudflare-challenged.
+_semaphore: asyncio.Semaphore | None = None
+
+
+def _fetch_semaphore() -> asyncio.Semaphore:
+    global _semaphore
+    if _semaphore is None:
+        from app.platform.config.snapshot import get_config
+
+        try:
+            limit = max(1, int(get_config("account.refresh.usage_concurrency", 50)))
+        except (TypeError, ValueError):
+            limit = 50
+        _semaphore = asyncio.Semaphore(limit)
+    return _semaphore
+
 
 async def _do_fetch(token: str, mode_name: str) -> dict:
     """POST the rate-limits endpoint for one mode and return parsed JSON body."""
@@ -108,13 +128,14 @@ async def _do_fetch(token: str, mode_name: str) -> dict:
     proxy = await get_proxy_runtime()
     lease = await proxy.acquire(affinity_key=token)
     try:
-        body = await post_json(
-            "https://grok.com/rest/rate-limits",
-            token,
-            _build_payload(mode_name),
-            lease=lease,
-            timeout_s=20.0,
-        )
+        async with _fetch_semaphore():
+            body = await post_json(
+                "https://grok.com/rest/rate-limits",
+                token,
+                _build_payload(mode_name),
+                lease=lease,
+                timeout_s=20.0,
+            )
         await proxy.feedback(
             lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS, status_code=200)
         )

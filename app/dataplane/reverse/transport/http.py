@@ -1,16 +1,21 @@
 """HTTP transport for reverse-proxy requests.
 
 Wraps curl_cffi AsyncSession; handles proxy selection, header building,
-retry-on-reset, and timeout.
+retry-on-reset, timeout, and session pooling (TLS handshakes are reused
+across calls via the process-wide SessionPool).
 """
 
+import asyncio
 from typing import AsyncGenerator
 
 from app.platform.logging.logger import logger
 from app.platform.errors import UpstreamError
 from app.control.proxy.models import ProxyLease
 from app.dataplane.proxy.adapters.headers import build_http_headers
-from app.dataplane.proxy.adapters.session import ResettableSession, build_session_kwargs
+from app.dataplane.proxy.adapters.session import (
+    ResettableSession,
+    get_session_pool,
+)
 
 
 async def post_stream(
@@ -26,7 +31,9 @@ async def post_stream(
 ) -> AsyncGenerator[str, None]:
     """POST *url* and yield SSE lines from the streaming response.
 
-    Raises ``UpstreamError`` on non-200 status.
+    Raises ``UpstreamError`` on non-200 status.  ``timeout_s`` bounds the
+    connect/headers phase and the per-line idle window — not the total
+    transfer, so long-lived streams are never cut off mid-generation.
     """
     headers = build_http_headers(
         token,
@@ -35,17 +42,20 @@ async def post_stream(
         referer=referer,
         lease=lease,
     )
-    kwargs = build_session_kwargs(lease=lease)
-
-    session = ResettableSession(**kwargs)
+    pool = get_session_pool()
+    pooled = await pool.acquire(lease=lease)
     try:
-        response = await session.post(
-            url,
-            headers=headers,
-            data=payload,
-            timeout=timeout_s,
-            stream=True,
-        )
+        session = await pooled.__aenter__()
+        try:
+            response = await asyncio.wait_for(
+                session.post(url, headers=headers, data=payload, stream=True),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError as exc:
+            raise UpstreamError(
+                f"Upstream headers not received within {timeout_s:.0f}s",
+                status=502,
+            ) from exc
 
         if response.status_code != 200:
             try:
@@ -58,28 +68,31 @@ async def post_stream(
                 response.status_code,
                 body,
             )
-            await session.close()
             raise UpstreamError(
                 f"Upstream returned {response.status_code}",
                 status=response.status_code,
                 body=body,
             )
-    except Exception:
-        try:
-            await session.close()
-        except Exception:
-            pass
+    except BaseException:
+        await pooled.__aexit__(None, None, None)
         raise
 
     async def _lines() -> AsyncGenerator[str, None]:
         try:
-            async for line in response.aiter_lines():
+            iterator = response.aiter_lines()
+            while True:
+                try:
+                    line = await asyncio.wait_for(anext(iterator), timeout=timeout_s)
+                except StopAsyncIteration:
+                    break
                 yield line
+        except asyncio.TimeoutError as exc:
+            pooled.discard()
+            raise UpstreamError(
+                f"Stream idle for {timeout_s:.0f}s", status=502
+            ) from exc
         finally:
-            try:
-                await session.close()
-            except Exception:
-                pass
+            await pooled.__aexit__(None, None, None)
 
     return _lines()
 
@@ -99,7 +112,7 @@ async def post_json(
     """POST *url* and return parsed JSON response body.
 
     Pass *session* to reuse an existing connection (avoids a new TLS handshake).
-    When *session* is ``None`` a fresh session is created and closed automatically.
+    When *session* is ``None`` a pooled session is checked out automatically.
     """
     headers = build_http_headers(
         token, content_type=content_type, origin=origin, referer=referer, lease=lease
@@ -131,7 +144,9 @@ async def post_json(
     if session is not None:
         return await _do(session)
 
-    async with ResettableSession(**build_session_kwargs(lease=lease)) as s:
+    pool = get_session_pool()
+    pooled = await pool.acquire(lease=lease)
+    async with pooled as s:
         return await _do(s)
 
 
@@ -153,9 +168,10 @@ async def get_json(
         referer=referer,
         lease=lease,
     )
-    kwargs = build_session_kwargs(lease=lease)
 
-    async with ResettableSession(**kwargs) as session:
+    pool = get_session_pool()
+    pooled = await pool.acquire(lease=lease)
+    async with pooled as session:
         response = await session.get(
             url,
             headers=headers,
@@ -200,9 +216,10 @@ async def delete_json(
         referer=referer,
         lease=lease,
     )
-    kwargs = build_session_kwargs(lease=lease)
 
-    async with ResettableSession(**kwargs) as session:
+    pool = get_session_pool()
+    pooled = await pool.acquire(lease=lease)
+    async with pooled as session:
         response = await session.delete(
             url,
             headers=headers,
@@ -243,7 +260,9 @@ async def get_bytes_stream(
 ) -> AsyncGenerator[bytes, None]:
     """GET *url* and yield raw bytes chunks from the streaming response.
 
-    Raises ``UpstreamError`` on non-200 status.
+    Raises ``UpstreamError`` on non-200 status.  ``timeout_s`` bounds the
+    connect/headers phase and the per-chunk idle window — not the total
+    transfer duration.
     """
     headers = build_http_headers(
         token,
@@ -257,17 +276,28 @@ async def get_bytes_stream(
     if headers.get("Sec-Fetch-Mode") == "navigate":
         headers.pop("Content-Type", None)
         headers.pop("Origin", None)
-    kwargs = build_session_kwargs(lease=lease)
 
-    session = ResettableSession(**kwargs)
+    pool = get_session_pool()
+    pooled = await pool.acquire(lease=lease)
     try:
-        response = await session.get(
-            url,
-            headers=headers,
-            timeout=timeout_s,
-            stream=True,
-            allow_redirects=True,
-        )
+        session = await pooled.__aenter__()
+        try:
+            response = await asyncio.wait_for(
+                session.get(
+                    url,
+                    headers=headers,
+                    timeout=timeout_s,
+                    stream=True,
+                    allow_redirects=True,
+                ),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError as exc:
+            raise UpstreamError(
+                f"Upstream headers not received within {timeout_s:.0f}s",
+                status=502,
+            ) from exc
+
         if response.status_code != 200:
             try:
                 body = (response.content).decode("utf-8", "replace")[:400]
@@ -279,29 +309,32 @@ async def get_bytes_stream(
                 response.status_code,
                 body,
             )
-            await session.close()
             raise UpstreamError(
                 f"Upstream returned {response.status_code}",
                 status=response.status_code,
                 body=body,
             )
-    except Exception:
-        try:
-            await session.close()
-        except Exception:
-            pass
+    except BaseException:
+        await pooled.__aexit__(None, None, None)
         raise
 
     async def _chunks() -> AsyncGenerator[bytes, None]:
         try:
-            async for chunk in response.aiter_content():
+            iterator = response.aiter_content()
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(anext(iterator), timeout=timeout_s)
+                except StopAsyncIteration:
+                    break
                 if chunk:
                     yield chunk
+        except asyncio.TimeoutError as exc:
+            pooled.discard()
+            raise UpstreamError(
+                f"Stream idle for {timeout_s:.0f}s", status=502
+            ) from exc
         finally:
-            try:
-                await session.close()
-            except Exception:
-                pass
+            await pooled.__aexit__(None, None, None)
 
     return _chunks()
 

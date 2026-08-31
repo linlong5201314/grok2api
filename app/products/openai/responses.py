@@ -2,15 +2,21 @@
 
 Unsupported request fields are silently discarded.
 Streaming emits standard Responses API SSE events.
+
+``previous_response_id`` multi-turn continuation is supported via an
+in-process response store (single-worker deployments; entries live for
+one hour).
 """
 
 import asyncio
+import time
+from collections import OrderedDict
 from typing import Any, AsyncGenerator
 
 
 from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
-from app.platform.errors import RateLimitError, UpstreamError
+from app.platform.errors import NotFoundError, RateLimitError, UpstreamError
 from app.platform.runtime.clock import now_s
 from app.platform.tokens import estimate_prompt_tokens, estimate_tokens, estimate_tool_call_tokens
 from app.control.model.enums import ModeId
@@ -29,6 +35,72 @@ from app.dataplane.reverse.protocol.tool_prompt import (
 )
 from app.dataplane.reverse.protocol.tool_parser import parse_tool_calls
 from ._tool_sieve import ToolSieve
+
+
+# ---------------------------------------------------------------------------
+# Response store — previous_response_id multi-turn continuation
+# ---------------------------------------------------------------------------
+
+_RESPONSE_STORE_MAX = 500
+_RESPONSE_TTL_S = 3600.0
+_response_store: "OrderedDict[str, dict]" = OrderedDict()
+
+
+def _assistant_store_message(full_text: str, fc_items: list[dict]) -> dict:
+    """Build the assistant message that continues the stored conversation."""
+    msg: dict = {"role": "assistant", "content": full_text or None}
+    if fc_items:
+        msg["tool_calls"] = [
+            {
+                "id":        item["call_id"],
+                "type":      "function",
+                "function":  {"name": item["name"], "arguments": item["arguments"]},
+            }
+            for item in fc_items
+        ]
+    return msg
+
+
+def _prune_response_store() -> None:
+    now = time.monotonic()
+    while _response_store:
+        _key, entry = next(iter(_response_store.items()))
+        if now - entry["ts"] <= _RESPONSE_TTL_S:
+            break
+        _response_store.popitem(last=False)
+
+
+def _remember_response(
+    response_id: str,
+    messages: list[dict],
+    *,
+    full_text: str,
+    fc_items: list[dict],
+) -> None:
+    """Persist conversation-so-far (input messages + assistant output)."""
+    _prune_response_store()
+    _response_store.pop(response_id, None)
+    _response_store[response_id] = {
+        "ts": time.monotonic(),
+        "messages": list(messages) + [_assistant_store_message(full_text, fc_items)],
+    }
+    while len(_response_store) > _RESPONSE_STORE_MAX:
+        _response_store.popitem(last=False)
+
+
+def _resolve_prior_messages(previous_response_id: str | None) -> list[dict]:
+    if not previous_response_id:
+        return []
+    _prune_response_store()
+    entry = _response_store.get(previous_response_id)
+    if entry is None:
+        raise NotFoundError(
+            f"Previous response with id {previous_response_id!r} not found. "
+            "Responses are kept in memory for one hour on the same worker "
+            "process only.",
+            param="previous_response_id",
+        )
+    return list(entry["messages"])
 
 
 # ---------------------------------------------------------------------------
@@ -225,12 +297,19 @@ async def create(
     top_p:        float,
     tools:        list[dict] | None = None,
     tool_choice:  Any = None,
+    previous_response_id: str | None = None,
+    store:        bool | None = None,
 ) -> dict | AsyncGenerator[str, None]:
 
     cfg     = get_config()
     spec    = resolve_model(model)
 
-    messages: list[dict] = []
+    def _make_resp(*args: Any, **kwargs: Any) -> dict:
+        if previous_response_id:
+            kwargs["previous_response_id"] = previous_response_id
+        return make_resp_object(*args, **kwargs)
+
+    messages: list[dict] = _resolve_prior_messages(previous_response_id)
     if instructions:
         messages.append({"role": "system", "content": instructions})
     messages.extend(_parse_input(input_val))
@@ -266,6 +345,10 @@ async def create(
     # -------------------------------------------------------------------------
     async def _run_stream() -> AsyncGenerator[str, None]:
         excluded: list[str] = []
+        # response.created must be emitted exactly once per stream; content
+        # events must never repeat after an account-level retry.
+        created_emitted = False
+        content_emitted = False
         for attempt in range(max_retries + 1):
             acct, selected_mode_id = await reserve_account(
                 directory,
@@ -293,10 +376,12 @@ async def create(
 
             try:
                 try:
-                    yield format_sse("response.created", {
-                        "type":     "response.created",
-                        "response": make_resp_object(response_id, model, "in_progress", []),
-                    })
+                    if not created_emitted:
+                        created_emitted = True
+                        yield format_sse("response.created", {
+                            "type":     "response.created",
+                            "response": _make_resp(response_id, model, "in_progress", []),
+                        })
 
                     ended = False
                     async for line in _stream_chat(
@@ -320,6 +405,7 @@ async def create(
                             if ev.kind == "thinking" and emit_think and not reasoning_closed:
                                 if not reasoning_started:
                                     reasoning_started = True
+                                    content_emitted = True
                                     yield format_sse("response.output_item.added", {
                                         "type":         "response.output_item.added",
                                         "output_index": 0,
@@ -380,6 +466,7 @@ async def create(
                                         fc_items = _build_fc_items(calls)
                                         detected_fc_items = fc_items
                                         base_idx = 1 if reasoning_started else 0
+                                        content_emitted = True
                                         async for evt in _emit_fc_events(fc_items, base_idx):
                                             yield evt
                                         tool_calls_emitted = True
@@ -393,6 +480,7 @@ async def create(
                                     msg_idx = 1 if reasoning_started else 0
                                     if not message_started:
                                         message_started = True
+                                        content_emitted = True
                                         yield format_sse("response.output_item.added", {
                                             "type":         "response.output_item.added",
                                             "output_index": msg_idx,
@@ -420,6 +508,7 @@ async def create(
 
                             elif ev.kind == "annotation" and ev.annotation_data:
                                 if message_started:
+                                    content_emitted = True
                                     collected_annotations.append(ev.annotation_data)
                                     msg_idx = 1 if reasoning_started else 0
                                     yield format_sse("response.output_text.annotation.added", {
@@ -445,6 +534,7 @@ async def create(
                             msg_idx = 1 if reasoning_started else 0
                             if not message_started:
                                 message_started = True
+                                content_emitted = True
                                 yield format_sse("response.output_item.added", {
                                     "type":         "response.output_item.added",
                                     "output_index": msg_idx,
@@ -472,6 +562,7 @@ async def create(
                             fc_items = _build_fc_items(calls)
                             detected_fc_items = fc_items
                             base_idx = 1 if reasoning_started else 0
+                            content_emitted = True
                             async for evt in _emit_fc_events(fc_items, base_idx):
                                 yield evt
                             tool_calls_emitted = True
@@ -493,13 +584,19 @@ async def create(
                         rt = estimate_tokens(full_think) if full_think else 0
                         yield format_sse("response.completed", {
                             "type":     "response.completed",
-                            "response": make_resp_object(
+                            "response": _make_resp(
                                 response_id, model, "completed", output,
                                 build_resp_usage(pt, ct + rt, rt),
                             ),
                         })
                         yield "data: [DONE]\n\n"
                         success = True
+                        if store is not False:
+                            _remember_response(
+                                response_id, messages,
+                                full_text="".join(text_buf),
+                                fc_items=detected_fc_items,
+                            )
                         logger.info("responses stream tool_calls: attempt={}/{} model={}",
                                     attempt + 1, max_retries + 1, model)
                     else:
@@ -591,20 +688,30 @@ async def create(
                         rt  = estimate_tokens(full_think) if full_think else 0
                         yield format_sse("response.completed", {
                             "type":     "response.completed",
-                            "response": make_resp_object(
+                            "response": _make_resp(
                                 response_id, model, "completed", output,
                                 build_resp_usage(pt, ct + rt, rt),
                             ),
                         })
                         yield "data: [DONE]\n\n"
                         success = True
+                        if store is not False:
+                            _remember_response(
+                                response_id, messages,
+                                full_text=full_text,
+                                fc_items=[],
+                            )
                         logger.info("responses stream completed: attempt={}/{} model={} text_len={} reasoning_len={} image_count={}",
                                     attempt + 1, max_retries + 1, model,
                                     len(full_text), len(full_think), len(adapter.image_urls))
 
                 except UpstreamError as exc:
                     fail_exc = exc
-                    if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
+                    if (
+                        _should_retry_upstream(exc, retry_codes)
+                        and attempt < max_retries
+                        and not content_emitted
+                    ):
                         _retry = True
                         logger.warning("responses stream retry scheduled: attempt={}/{} status={} token={}...",
                                        attempt + 1, max_retries, exc.status, token[:8])
@@ -746,7 +853,13 @@ async def create(
             ct = estimate_tool_call_tokens(tc_result.calls)
             rt = estimate_tokens(full_think) if full_think else 0
             logger.info("responses tool_calls: model={} calls={}", model, len(tc_result.calls))
-            return make_resp_object(
+            if store is not False:
+                _remember_response(
+                    response_id, messages,
+                    full_text=full_text,
+                    fc_items=_build_fc_items(tc_result.calls),
+                )
+            return _make_resp(
                 response_id, model, "completed", output,
                 build_resp_usage(pt, ct + rt, rt),
             )
@@ -777,7 +890,9 @@ async def create(
     pt = estimate_prompt_tokens(message)
     ct = estimate_tokens(full_text)
     rt = estimate_tokens(full_think) if full_think else 0
-    return make_resp_object(
+    if store is not False:
+        _remember_response(response_id, messages, full_text=full_text, fc_items=[])
+    return _make_resp(
         response_id, model, "completed", output,
         build_resp_usage(pt, ct + rt, rt),
     )

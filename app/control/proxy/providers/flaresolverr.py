@@ -8,11 +8,36 @@ from urllib.parse import urlparse
 
 from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
-from ..models import ClearanceBundle, ClearanceMode
+from ..models import ClearanceBundle, ClearanceMode, redact_url
 
 
 def _extract_all_cookies(cookies: list[dict]) -> str:
     return "; ".join(f"{c.get('name')}={c.get('value')}" for c in cookies)
+
+
+def _flaresolverr_proxy_url(proxy_url: str) -> str:
+    """Translate a loopback proxy URL for FlareSolverr's container viewpoint.
+
+    FlareSolverr typically runs in a Docker container: a proxy URL pointing
+    at ``127.0.0.1``/``localhost`` refers to the *host* from the service's
+    perspective, but to the container itself from FlareSolverr's.  Rewrite
+    loopback hosts to ``host.docker.internal`` (override via the
+    ``FLARESOLVERR_HOST_ALIAS`` env var for other setups, e.g. a native
+    FlareSolverr process where the loopback is correct).
+    """
+    if not proxy_url:
+        return proxy_url
+    import os
+
+    parts = urlparse(proxy_url)
+    host = (parts.hostname or "").lower()
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return proxy_url
+    alias = os.getenv("FLARESOLVERR_HOST_ALIAS", "host.docker.internal")
+    netloc = parts.netloc.replace(parts.hostname, alias, 1)
+    from urllib.parse import urlunparse
+
+    return urlunparse(parts._replace(netloc=netloc))
 
 
 class FlareSolverrClearanceProvider:
@@ -36,14 +61,14 @@ class FlareSolverrClearanceProvider:
 
         result = await self._solve(
             fs_url      = fs_url,
-            proxy_url   = proxy_url,
+            proxy_url   = _flaresolverr_proxy_url(proxy_url),
             timeout_sec = timeout_sec,
             target_url  = target_url,
         )
         if not result:
             logger.warning(
                 "flaresolverr clearance refresh failed: affinity={} proxy={} target={}",
-                affinity_key, proxy_url or "<direct>", target_url,
+                affinity_key, redact_url(proxy_url) or "<direct>", target_url,
             )
             return None
         host = result.get("clearance_host", "grok.com")

@@ -49,6 +49,14 @@ def _make_tool_id() -> str:
     return f"toolu_{int(time.time() * 1000)}{os.urandom(3).hex()}"
 
 
+# Opaque placeholder signature for thinking blocks. The official Anthropic
+# API signs thinking content server-side; replayed thinking blocks carry the
+# signature back to THIS gateway, which flattens messages and never
+# re-validates it. Emitting one keeps official SDK clients that expect the
+# signature_delta event working.
+_THINKING_SIGNATURE = "grok2api-local"
+
+
 # ---------------------------------------------------------------------------
 # SSE encoding (Anthropic event format)
 # ---------------------------------------------------------------------------
@@ -335,6 +343,10 @@ async def create(
         yield _sse("ping", {"type": "ping"})
 
         excluded: list[str] = []
+        # Content blocks must never repeat after an account-level retry:
+        # once any content_block event reached the client, a fresh attempt
+        # would re-emit blocks with the same index (a protocol error).
+        content_emitted = False
         for attempt in range(max_retries + 1):
             acct, selected_mode_id = await reserve_account(
                 directory,
@@ -385,6 +397,7 @@ async def create(
                             if ev.kind == "thinking" and emit_think and not think_closed:
                                 if not think_started:
                                     think_started = True
+                                    content_emitted = True
                                     yield _sse("content_block_start", {
                                         "type":          "content_block_start",
                                         "index":         block_index,
@@ -401,6 +414,11 @@ async def create(
                                 # Close thinking block if open
                                 if think_started and not think_closed:
                                     think_closed = True
+                                    yield _sse("content_block_delta", {
+                                        "type":  "content_block_delta",
+                                        "index": block_index,
+                                        "delta": {"type": "signature_delta", "signature": _THINKING_SIGNATURE},
+                                    })
                                     yield _sse("content_block_stop", {
                                         "type":  "content_block_stop",
                                         "index": block_index,
@@ -423,6 +441,7 @@ async def create(
                                             text_started = False
                                         # Emit tool_use blocks
                                         for call in calls:
+                                            content_emitted = True
                                             yield _sse("content_block_start", {
                                                 "type":  "content_block_start",
                                                 "index": block_index,
@@ -457,6 +476,7 @@ async def create(
                                 if text_chunk:
                                     if not text_started:
                                         text_started = True
+                                        content_emitted = True
                                         yield _sse("content_block_start", {
                                             "type":          "content_block_start",
                                             "index":         block_index,
@@ -485,6 +505,7 @@ async def create(
                         if flush_text:
                             if not text_started:
                                 text_started = True
+                                content_emitted = True
                                 yield _sse("content_block_start", {
                                     "type":          "content_block_start",
                                     "index":         block_index,
@@ -506,6 +527,7 @@ async def create(
                                 block_index += 1
                                 text_started = False
                             for call in calls:
+                                content_emitted = True
                                 yield _sse("content_block_start", {
                                     "type":  "content_block_start",
                                     "index": block_index,
@@ -574,6 +596,11 @@ async def create(
 
                         # Close open blocks
                         if think_started and not think_closed:
+                            yield _sse("content_block_delta", {
+                                "type":  "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "signature_delta", "signature": _THINKING_SIGNATURE},
+                            })
                             yield _sse("content_block_stop", {
                                 "type":  "content_block_stop",
                                 "index": block_index,
@@ -615,7 +642,11 @@ async def create(
 
                 except UpstreamError as exc:
                     fail_exc = exc
-                    if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
+                    if (
+                        _should_retry_upstream(exc, retry_codes)
+                        and attempt < max_retries
+                        and not content_emitted
+                    ):
                         _retry = True
                         logger.warning(
                             "messages stream retry: attempt={}/{} status={} token={}...",

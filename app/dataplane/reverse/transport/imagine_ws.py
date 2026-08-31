@@ -300,8 +300,29 @@ async def stream_images(
     inter_round_wait_s = _INTER_ROUND_WAIT_S
 
     collected = 0
+    # Finite overall budget: without it a server that accepts rounds but
+    # never produces slots (or closes the WS immediately every time) leaves
+    # the caller hanging forever.
+    started = time.monotonic()
+    total_deadline_s = timeout_s * (n + 1) + 60.0
+    reconnects = 0
+    max_reconnects = 5
+    stalled_rounds = 0
 
     while collected < n:
+        elapsed_total = time.monotonic() - started
+        if elapsed_total > total_deadline_s:
+            logger.error(
+                "imagine total budget exceeded: elapsed_s={:.0f} deadline_s={:.0f} collected={}/{}",
+                elapsed_total, total_deadline_s, collected, n,
+            )
+            yield {
+                "type":       "error",
+                "error_code": "timeout",
+                "error":      f"image generation exceeded its {total_deadline_s:.0f}s total budget ({collected}/{n} images)",
+            }
+            return
+
         needed = n - collected
 
         # ── Establish connection ──────────────────────────────────────────────
@@ -336,6 +357,7 @@ async def stream_images(
             async with conn as ws:
                 while collected < n:
                     needed = n - collected
+                    before_round = collected
                     async for ev in _stream_round(
                         ws, prompt,
                         aspect_ratio       = aspect_ratio,
@@ -362,6 +384,21 @@ async def stream_images(
                     if ws_closed or collected >= n:
                         break   # exit inner while; reconnect or finish
 
+                    if collected == before_round:
+                        # The connection stays open but rounds keep producing
+                        # nothing — bail out instead of spinning forever.
+                        stalled_rounds += 1
+                        if stalled_rounds >= 2:
+                            await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR))
+                            yield {
+                                "type":       "error",
+                                "error_code": "no_progress",
+                                "error":      "two consecutive rounds produced no images",
+                            }
+                            return
+                    else:
+                        stalled_rounds = 0
+
         except aiohttp.ClientError as exc:
             logger.error("imagine websocket connection failed: error={}", exc)
             await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.TRANSPORT_ERROR))
@@ -375,7 +412,19 @@ async def stream_images(
         # Server closed the connection but we still need more images → reconnect.
         # Give back the current lease before acquiring a new one on the next iteration.
         await proxy.feedback(lease, ProxyFeedback(kind=ProxyFeedbackKind.SUCCESS, status_code=200))
-        logger.info("imagine websocket reconnecting: remaining_images={} requested_images={}", n - collected, n)
+        reconnects += 1
+        if reconnects > max_reconnects:
+            logger.error(
+                "imagine reconnect budget exhausted: reconnects={} collected={}/{}",
+                max_reconnects, collected, n,
+            )
+            yield {
+                "type":       "error",
+                "error_code": "reconnect_exhausted",
+                "error":      f"upstream kept closing the connection ({max_reconnects} reconnects, {collected}/{n} images)",
+            }
+            return
+        logger.info("imagine websocket reconnecting: remaining_images={} requested_images={} reconnects={}", n - collected, n, reconnects)
 
 
 __all__ = ["stream_images"]
