@@ -163,3 +163,44 @@ def test_anthropic_error_payload_mapping():
     assert _anthropic_error_payload(RateLimitError())["type"] == "rate_limit_error"
     assert _anthropic_error_payload(NotFoundError("x"))["type"] == "not_found_error"
     assert _anthropic_error_payload(ValidationError("x"))["type"] == "invalid_request_error"
+
+
+# ---------------------------------------------------------------------------
+# Clearance UA precedence (regression: per-account fingerprint must not
+# override the FlareSolverr bundle UA, or cf_clearance is rejected on
+# UA mismatch and every request 403s)
+# ---------------------------------------------------------------------------
+
+
+def _make_lease(*, bundle_ua: str = "", cookies: str = "", seed: str = "tok-abc"):
+    from app.control.proxy.models import ProxyLease
+
+    return ProxyLease(
+        lease_id="l1",
+        proxy_url="",
+        cf_cookies=cookies,
+        user_agent=bundle_ua,
+        fingerprint_seed=seed,
+    )
+
+
+def test_clearance_bundle_ua_wins_over_fingerprint():
+    from app.dataplane.proxy.adapters.profile import resolve_proxy_profile
+
+    bundle_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+    lease = _make_lease(
+        bundle_ua=bundle_ua,
+        cookies="cf_clearance=abc123; other=1",
+    )
+    profile = resolve_proxy_profile(lease)
+    assert profile.user_agent == bundle_ua
+    assert profile.cf_clearance == "abc123"
+
+
+def test_fingerprint_ua_used_when_no_bundle_ua():
+    from app.control.proxy.fingerprint import stable_user_agent
+    from app.dataplane.proxy.adapters.profile import resolve_proxy_profile
+
+    lease = _make_lease(bundle_ua="", seed="tok-xyz")
+    profile = resolve_proxy_profile(lease)
+    assert profile.user_agent == stable_user_agent("tok-xyz")

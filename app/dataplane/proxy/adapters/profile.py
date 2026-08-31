@@ -79,15 +79,22 @@ def browser_from_user_agent(user_agent: str) -> str:
 def resolve_proxy_profile(lease: ProxyLease | None) -> ProxyProfile:
     """Resolve cookies, UA, clearance and curl_cffi browser from one source order.
 
-    Priority: per-account stable fingerprint (when enabled and seeded) →
-    lease-carried values → flat legacy config keys → nested v2 clearance keys.
-    The resolved browser is derived from the effective User-Agent, keeping
-    header UA, client-hints and curl_cffi impersonation aligned.
+    Priority: clearance-bundle UA (bound to the cf_clearance cookie) →
+    per-account stable fingerprint (when enabled and seeded) → flat legacy
+    config keys → nested v2 clearance keys.  The resolved browser is derived
+    from the effective User-Agent, keeping header UA, client-hints and
+    curl_cffi impersonation aligned.
     """
     cfg = resolve_clearance_config()
 
     user_agent = ""
-    if (
+    if lease is not None and lease.user_agent:
+        # The clearance bundle's UA is bound to its cf_clearance cookie.
+        # It must win over the per-account fingerprint — otherwise requests
+        # go out with a different UA than the one Cloudflare issued the
+        # cookie for, and the clearance is rejected (persistent 403).
+        user_agent = lease.user_agent
+    elif (
         lease is not None
         and lease.fingerprint_seed
         and _per_account_fingerprint_enabled()
