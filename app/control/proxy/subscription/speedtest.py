@@ -65,6 +65,25 @@ def _is_cloudflare_challenge(resp) -> bool:
     return False
 
 
+def _is_grok_origin_response(resp) -> bool:
+    """Return True only for a genuine answer from the grok origin.
+
+    The probe sends bogus credentials, so the sole legitimate reply is a
+    401 JSON error from grok.com itself.  A proxy/sing-box error page
+    (instant, plaintext) also satisfies ``status_code > 0`` and must NOT be
+    counted as a healthy node — otherwise dead nodes score lowest-latency
+    and soak up all account bindings.
+    """
+    if int(getattr(resp, "status_code", 0) or 0) != 401:
+        return False
+    try:
+        body = getattr(resp, "content", None) or b""
+        text = (body if isinstance(body, bytes) else str(body).encode())[:2000].lower()
+        return b"credentials" in text or b"code" in text
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @dataclass(slots=True)
 class ProbeOutcome:
     node_id: str
@@ -194,6 +213,11 @@ class NodeSpeedTester:
                 # Cloudflare / geo block, not an auth answer.
                 if is_default_probe and resp.status_code == 403:
                     return None, "challenge"
+                if is_default_probe and not _is_grok_origin_response(resp):
+                    # Not a genuine grok answer — e.g. sing-box returned its
+                    # own error page because the outbound is dead.  Counting
+                    # this as ok would rank dead nodes at the top.
+                    return None, "unreachable"
                 return elapsed_ms, "ok"
             return None, "unreachable"
         except Exception:  # noqa: BLE001 — probe failures are expected noise
