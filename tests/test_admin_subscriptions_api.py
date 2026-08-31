@@ -14,7 +14,10 @@ from app.control.proxy.subscription.models import SubNode, SubProtocol
 
 @pytest.fixture()
 def client(monkeypatch):
-    # Import after env is clean; default app_key is "grok2api".
+    # Pin the admin key explicitly: env has the highest priority in the
+    # config chain, so a developer-local data/config.toml (or Zeabur env)
+    # can not leak in and change the expected credential.
+    monkeypatch.setenv("GROK_APP_APP_KEY", "grok2api")
     from app.main import app
 
     manager = get_subscription_manager()
