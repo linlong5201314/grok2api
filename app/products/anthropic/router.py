@@ -48,9 +48,43 @@ class MessagesRequest(BaseModel):
     thinking:    Any = None          # {type:"enabled", budget_tokens:N} — used to enable thinking output
 
 
+class CountTokensRequest(BaseModel):
+    model_config = {"extra": "ignore"}
+
+    model:    str
+    messages: list[_Message] = []
+    system:   Any = None
+    tools:    list[dict] | None = None
+    thinking: Any = None
+
+
 # ---------------------------------------------------------------------------
 # SSE error wrapper
 # ---------------------------------------------------------------------------
+
+_ANTHROPIC_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    429: "rate_limit_error",
+    503: "overloaded_error",
+}
+
+
+def _anthropic_error_payload(exc: AppError) -> dict:
+    """Map an AppError to Anthropic's canonical error.type vocabulary."""
+    status = getattr(exc, "status", 500) or 500
+    if isinstance(getattr(exc, "kind", None), str) and exc.kind in set(
+        _ANTHROPIC_ERROR_TYPES.values()
+    ):
+        err_type = exc.kind
+    else:
+        err_type = _ANTHROPIC_ERROR_TYPES.get(
+            status, "api_error" if status >= 500 else "invalid_request_error"
+        )
+    return {"type": err_type, "message": exc.message}
+
 
 async def _safe_sse_anthropic(stream):
     """Wrap an Anthropic SSE stream, converting exceptions to error events."""
@@ -58,8 +92,9 @@ async def _safe_sse_anthropic(stream):
         async for chunk in stream:
             yield chunk
     except AppError as exc:
-        err = exc.to_dict()["error"]
-        payload = orjson.dumps({"type": "error", "error": err}).decode()
+        payload = orjson.dumps(
+            {"type": "error", "error": _anthropic_error_payload(exc)}
+        ).decode()
         yield f"event: error\ndata: {payload}\n\n"
         yield "data: [DONE]\n\n"
     except Exception as exc:
@@ -110,8 +145,8 @@ async def messages_endpoint(req: MessagesRequest):
         system       = req.system,
         stream       = is_stream,
         emit_think   = emit_think,
-        temperature  = req.temperature or 0.8,
-        top_p        = req.top_p or 0.95,
+        temperature  = req.temperature if req.temperature is not None else 0.8,
+        top_p        = req.top_p if req.top_p is not None else 0.95,
         tools        = req.tools or None,
         tool_choice  = req.tool_choice,
     )
@@ -123,6 +158,24 @@ async def messages_endpoint(req: MessagesRequest):
         media_type = "text/event-stream",
         headers    = _SSE_HEADERS,
     )
+
+
+# ---------------------------------------------------------------------------
+# /v1/messages/count_tokens
+# ---------------------------------------------------------------------------
+
+@router.post("/messages/count_tokens", tags=[_TAG_MESSAGES])
+async def count_tokens_endpoint(req: CountTokensRequest):
+    """Anthropic-compatible token estimation (tiktoken heuristic)."""
+    from .messages import _parse_anthropic_messages
+    from app.products.openai.chat import _extract_message
+    from app.platform.tokens import estimate_prompt_tokens
+
+    internal = _parse_anthropic_messages(
+        [m.model_dump() for m in req.messages], req.system
+    )
+    text, _files = _extract_message(internal)
+    return JSONResponse({"input_tokens": estimate_prompt_tokens(text)})
 
 
 __all__ = ["router"]

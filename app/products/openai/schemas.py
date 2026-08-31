@@ -39,6 +39,11 @@ class ChatCompletionRequest(BaseModel):
     tool_choice:         str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None                = True
     max_tokens:          int | None                 = None
+    # {"include_usage": true} → emit a usage object on the final stream chunk
+    stream_options:      dict[str, Any] | None      = None
+    # {"type": "json_object"} or {"type": "json_schema", "json_schema": {...}}
+    # enforced best-effort via prompt instruction (Grok web has no native switch)
+    response_format:     dict[str, Any] | None      = None
 
 
 class ImageGenerationRequest(BaseModel):

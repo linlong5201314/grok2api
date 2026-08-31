@@ -158,6 +158,8 @@ def make_resp_object(
     status:      str,
     output:      list[dict],
     usage:       dict | None = None,
+    *,
+    previous_response_id: str | None = None,
 ) -> dict:
     obj: dict = {
         "id":         response_id,
@@ -167,6 +169,8 @@ def make_resp_object(
         "model":      model,
         "output":     output,
     }
+    if previous_response_id is not None:
+        obj["previous_response_id"] = previous_response_id
     if usage is not None:
         obj["usage"] = usage
     return obj

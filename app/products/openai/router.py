@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 
 from app.control.account.state_machine import is_manageable
 from app.platform.auth.middleware import verify_api_key
-from app.platform.errors import AppError, ValidationError
+from app.platform.errors import AppError, NotFoundError, ValidationError
 from app.platform.logging.logger import logger
 from app.platform.storage import image_files_dir, video_files_dir
 from app.control.model import registry as model_registry
@@ -309,8 +309,10 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 emit_think=emit_think,
                 tools=req.tools,
                 tool_choice=req.tool_choice,
-                temperature=req.temperature or 0.8,
-                top_p=req.top_p or 0.95,
+                temperature=req.temperature if req.temperature is not None else 0.8,
+                top_p=req.top_p if req.top_p is not None else 0.95,
+                stream_options=req.stream_options,
+                response_format=req.response_format,
             )
 
     except AppError:
@@ -411,10 +413,12 @@ async def responses_endpoint(req: ResponsesCreateRequest):
         instructions=req.instructions,
         stream=is_stream,
         emit_think=emit_think,
-        temperature=req.temperature or 0.8,
-        top_p=req.top_p or 0.95,
+        temperature=req.temperature if req.temperature is not None else 0.8,
+        top_p=req.top_p if req.top_p is not None else 0.95,
         tools=req.tools or None,
         tool_choice=req.tool_choice,
+        previous_response_id=req.previous_response_id,
+        store=req.store,
     )
 
     if isinstance(result, dict):
@@ -587,7 +591,7 @@ async def serve_video(id: str = Query(..., description="Video file ID")):
     if path.exists():
         return FileResponse(path, media_type="video/mp4")
 
-    raise ValidationError(f"Video {id!r} not found", param="id")
+    raise NotFoundError(f"Video {id!r} not found", param="id")
 
 
 @router.get("/files/image", tags=[_TAG_FILES])
@@ -605,7 +609,7 @@ async def serve_image(id: str = Query(..., description="Image file ID")):
             mime = "image/png" if ext == ".png" else "image/jpeg"
             return FileResponse(path, media_type=mime)
 
-    raise ValidationError(f"Image {id!r} not found", param="id")
+    raise NotFoundError(f"Image {id!r} not found", param="id")
 
 
 __all__ = ["router"]
