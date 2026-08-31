@@ -50,6 +50,39 @@ def test_env_overrides_creates_missing_sections(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# get_list parsing (JSON array + comma-separated)
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_with(data: dict):
+    from app.platform.config.snapshot import ConfigSnapshot
+
+    snap = ConfigSnapshot()
+    snap._data = data
+    return snap
+
+
+def test_get_list_parses_json_array_form():
+    snap = _snapshot_with({
+        "proxy": {"subscription": {"urls": '["https://a.example/x","https://b.example/y"]'}}
+    })
+    assert snap.get_list("proxy.subscription.urls") == [
+        "https://a.example/x",
+        "https://b.example/y",
+    ]
+
+
+def test_get_list_comma_separated_still_works():
+    snap = _snapshot_with({"a": {"b": "x,y, z"}})
+    assert snap.get_list("a.b") == ["x", "y", "z"]
+
+
+def test_get_list_real_list_passthrough():
+    snap = _snapshot_with({"a": {"b": ["x", "y"]}})
+    assert snap.get_list("a.b") == ["x", "y"]
+
+
+# ---------------------------------------------------------------------------
 # Proxy URL redaction
 # ---------------------------------------------------------------------------
 

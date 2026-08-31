@@ -121,7 +121,21 @@ class ConfigSnapshot:
         if isinstance(val, list):
             return val
         if isinstance(val, str):
-            return [p.strip() for p in val.split(",") if p.strip()]
+            text = val.strip()
+            if text.startswith("["):
+                # Accept JSON-array form (e.g. GROK_PROXY__SUBSCRIPTION__URLS
+                # = ["https://a","https://b"]).  Without this, the string is
+                # split on commas and the bracket/quote characters end up
+                # inside the entries, corrupting every URL.
+                try:
+                    import json
+
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+                except (ValueError, TypeError):
+                    pass
+            return [p.strip() for p in text.split(",") if p.strip()]
         return [val]
 
     async def update(self, patch: dict[str, Any]) -> None:
