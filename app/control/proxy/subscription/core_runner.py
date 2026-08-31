@@ -76,6 +76,22 @@ class CoreRunner:
     def is_running(self) -> bool:
         return self._process is not None and self._process.returncode is None
 
+    @staticmethod
+    def _listen_host() -> str:
+        """Bind address for the per-node mixed inbounds.
+
+        Defaults to 127.0.0.1 (only this process can use the ports).  On
+        container platforms (e.g. Zeabur/Kubernetes) FlareSolverr runs in a
+        *separate* container and must reach these ports over the internal
+        network — set ``proxy.subscription.core_listen_host`` to ``0.0.0.0``
+        there and point ``FLARESOLVERR_HOST_ALIAS`` at this service's
+        internal hostname so the rewritten proxy URL resolves.
+        """
+        from app.platform.config.snapshot import get_config
+
+        host = get_config().get_str("proxy.subscription.core_listen_host", "127.0.0.1").strip()
+        return host or "127.0.0.1"
+
     def port_for(self, node_id: str) -> int:
         return self._port_map.get(node_id, 0)
 
@@ -220,7 +236,7 @@ class CoreRunner:
             inbound = {
                 "type": "mixed",
                 "tag": in_tag,
-                "listen": "127.0.0.1",
+                "listen": self._listen_host(),
                 "listen_port": port,
             }
             outbound["tag"] = out_tag

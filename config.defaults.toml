@@ -118,6 +118,10 @@ allow_direct_fallback = false
 fetch_user_agent = "ClashMetaForAndroid/2.11.5.Meta"
 # sing-box 可执行文件路径（可选；配置后 vmess/vless/trojan/ss 节点经本地 core 出口）
 core_path = ""
+# sing-box 本地入站监听地址（默认 127.0.0.1 仅本进程可用）；
+# 容器平台（Zeabur/K8s）上 FlareSolverr 跑在独立容器时设为 0.0.0.0，
+# 并把环境变量 FLARESOLVERR_HOST_ALIAS 设为本服务的内网主机名
+core_listen_host = "127.0.0.1"
 # 本地 mixed 入站起始端口（每个核心协议节点占用一个）
 core_start_port = 21001
 # 测速探测目标 URL（任何能快速返回 HTTP 状态码的地址）
