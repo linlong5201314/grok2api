@@ -18,7 +18,6 @@ from .lease import AccountLease, new_lease
 from .selector import current_strategy, select, select_any
 from .sync import bootstrap as _bootstrap, apply_changes
 from . import feedback as fb
-from ..shared.enums import POOL_ID_TO_STR, StatusId
 
 if TYPE_CHECKING:
     pass
@@ -262,17 +261,21 @@ class AccountDirectory:
 
             elif kind == FeedbackKind.RATE_LIMITED:
                 if strategy == "random":
-                    pool_id = int(table.pool_by_idx[idx])
-                    cooling_sec = _pool_cooling_sec(pool_id)
+                    cooling_sec = _pool_cooling_sec()
                     fb.apply_rate_limited_random(table, idx, cooling_sec=cooling_sec)
                 else:
                     fb.apply_rate_limited_quota(table, idx, mode_id)
                 fb.update_last_fail(table, idx, ts)
 
             elif kind == FeedbackKind.UNAUTHORIZED:
+                # Runtime table must not apply the terminal EXPIRED state on an
+                # unconfirmed 401: a transient upstream session rotation would
+                # permanently kill the slot locally, while the control plane
+                # (which requires confirmation before expiring) never emits a
+                # patch that would restore it. Health degradation alone is
+                # self-healing; EXPIRED remains a control-plane decision.
                 fb.apply_auth_failure(table, idx)
                 fb.update_last_fail(table, idx, ts)
-                fb.apply_status_change(table, idx, int(StatusId.EXPIRED))
 
             elif kind == FeedbackKind.FORBIDDEN:
                 fb.apply_forbidden(table, idx)
@@ -306,20 +309,23 @@ class AccountDirectory:
 # ---------------------------------------------------------------------------
 
 
-_POOL_INTERVAL_CONFIG: dict[str, tuple[str, int]] = {
-    "basic": ("account.refresh.basic_interval_sec", 86_400),
-    "super": ("account.refresh.super_interval_sec", 7_200),
-    "heavy": ("account.refresh.heavy_interval_sec", 7_200),
-}
+_COOLING_DEFAULT_SEC = 600
 
 
-def _pool_cooling_sec(pool_id: int) -> int:
-    """Cooling seconds for a 429 on a given pool (random strategy only)."""
-    pool_str = POOL_ID_TO_STR.get(pool_id, "basic")
-    interval_key, default_interval = _POOL_INTERVAL_CONFIG.get(
-        pool_str, _POOL_INTERVAL_CONFIG["basic"]
-    )
-    return max(0, int(get_config(interval_key, default_interval)))
+def _pool_cooling_sec() -> int:
+    """Cooling seconds applied after a 429 (random strategy only).
+
+    Uses the dedicated ``account.selection.cooling_sec`` window (default
+    10 minutes). The legacy behaviour reused the pool refresh interval
+    (up to 24 h for the basic pool), which froze an account for a whole
+    day after a single rate-limit hit — far longer than the upstream 429
+    window actually lasts.
+    """
+    configured = get_config("account.selection.cooling_sec", _COOLING_DEFAULT_SEC)
+    try:
+        return max(0, int(configured))
+    except (TypeError, ValueError):
+        return _COOLING_DEFAULT_SEC
 
 
 # ---------------------------------------------------------------------------

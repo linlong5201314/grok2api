@@ -469,18 +469,35 @@ class SqlAccountRepository:
     # Upsert — dialect-specific
     # ------------------------------------------------------------------
 
+    # Columns preserved on re-import conflict (aligned with the local/SQLite
+    # backend): usage statistics and fetched quota windows must survive a
+    # duplicate upsert instead of being reset to defaults.
+    _UPSERT_CONFLICT_PRESERVE = frozenset({
+        "token", "created_at",
+        "usage_use_count", "usage_fail_count", "usage_sync_count",
+        "quota_auto", "quota_fast", "quota_expert",
+        "quota_heavy", "quota_grok_4_3", "quota_build",
+    })
+
     def _build_upsert(self, row: dict[str, Any]):
         if self._dialect == "postgresql":
             from sqlalchemy.dialects.postgresql import insert
             stmt = insert(accounts_table).values(**row)
-            # On conflict, update all columns except token and created_at.
-            update_cols = {k: stmt.excluded[k] for k in row if k not in ("token", "created_at")}
+            # On conflict, update all columns except token/created_at and the
+            # preserved usage/quota columns.
+            update_cols = {
+                k: stmt.excluded[k] for k in row
+                if k not in self._UPSERT_CONFLICT_PRESERVE
+            }
             return stmt.on_conflict_do_update(index_elements=["token"], set_=update_cols)
         else:
             # MySQL
             from sqlalchemy.dialects.mysql import insert
             stmt = insert(accounts_table).values(**row)
-            update_cols = {k: stmt.inserted[k] for k in row if k not in ("token", "created_at")}
+            update_cols = {
+                k: stmt.inserted[k] for k in row
+                if k not in self._UPSERT_CONFLICT_PRESERVE
+            }
             return stmt.on_duplicate_key_update(**update_cols)
 
     # ------------------------------------------------------------------
@@ -517,10 +534,14 @@ class SqlAccountRepository:
                 )
             else:
                 from sqlalchemy.dialects.mysql import insert as my_insert
+                stmt = my_insert(meta_table).values(key="revision", value="0")
+                # Keep the existing revision on duplicate: every worker runs
+                # initialize() at startup, and resetting the counter would put
+                # it below the sync watermarks already held by other running
+                # workers, stalling their incremental change scans until the
+                # counter climbed back past the historical maximum.
                 await conn.execute(
-                    my_insert(meta_table)
-                    .values(key="revision", value="0")
-                    .on_duplicate_key_update(value="0")
+                    stmt.on_duplicate_key_update(value=meta_table.c.value)
                 )
 
     async def _ensure_columns(self, conn: Any) -> None:
@@ -725,12 +746,21 @@ class SqlAccountRepository:
                     updates["quota_heavy"] = json.dumps(patch.quota_heavy)
                 if patch.quota_grok_4_3 is not None:
                     updates["quota_grok_4_3"] = json.dumps(patch.quota_grok_4_3)
+                # Atomic in-database increments: multiple workers patch the
+                # same row concurrently, and a read-modify-write here would
+                # silently drop the other worker's increment.
                 if patch.usage_use_delta is not None:
-                    updates["usage_use_count"] = max(0, record.usage_use_count + patch.usage_use_delta)
+                    updates["usage_use_count"] = sa.func.greatest(
+                        0, accounts_table.c.usage_use_count + patch.usage_use_delta
+                    )
                 if patch.usage_fail_delta is not None:
-                    updates["usage_fail_count"] = max(0, record.usage_fail_count + patch.usage_fail_delta)
+                    updates["usage_fail_count"] = sa.func.greatest(
+                        0, accounts_table.c.usage_fail_count + patch.usage_fail_delta
+                    )
                 if patch.usage_sync_delta is not None:
-                    updates["usage_sync_count"] = max(0, record.usage_sync_count + patch.usage_sync_delta)
+                    updates["usage_sync_count"] = sa.func.greatest(
+                        0, accounts_table.c.usage_sync_count + patch.usage_sync_delta
+                    )
 
                 tags = list(record.tags)
                 if patch.tags is not None:

@@ -66,7 +66,14 @@ async def execute(
     # Step 3: Acquire proxy — bound to the reserved account so subscription
     # egress keeps one stable best-speed IP per account (anti-correlation).
     proxy_runtime = await get_proxy_runtime()
-    proxy_lease = await proxy_runtime.acquire(affinity_key=lease.token)
+    try:
+        proxy_lease = await proxy_runtime.acquire(affinity_key=lease.token)
+    except Exception:
+        # Release the reserved account slot before propagating — otherwise
+        # the inflight counter leaks and this account becomes permanently
+        # unselectable in this worker (max_inflight exhaustion).
+        await directory.release(lease)
+        raise
 
     leases = ReverseLeaseSet(
         account_idx=lease.idx,
