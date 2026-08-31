@@ -57,11 +57,26 @@ def _extract_bearer(authorization: str | None) -> str | None:
     return token
 
 
+def _safe_equals(a: str, b: str) -> bool:
+    """Constant-time string comparison that tolerates non-ASCII input.
+
+    ``hmac.compare_digest`` raises TypeError when either str argument
+    contains non-ASCII characters, which would turn a malformed
+    Authorization header (latin-1 decoded high bytes) or a non-ASCII
+    configured key into a 500 instead of a clean 401/403.
+    """
+    try:
+        return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+    except (UnicodeEncodeError, AttributeError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
 
 async def verify_api_key(
+    request: Request,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ) -> None:
@@ -70,17 +85,30 @@ async def verify_api_key(
     Accepts either ``Authorization: Bearer <key>`` (OpenAI / grok2api style)
     or ``X-API-Key: <key>`` (official Anthropic SDK style) so that agents
     targeting the Anthropic-compatible endpoint work without reconfiguration.
+
+    When ``app.api_key`` is empty the endpoint stays open (legacy behaviour)
+    unless ``app.reject_empty_api_key`` is enabled.
     """
     allowed_keys = _get_keys()
     if not allowed_keys:
+        if get_config("app.reject_empty_api_key", False):
+            raise HTTPException(
+                status.HTTP_401_UNAUTHORIZED,
+                "API key is not configured; set app.api_key (or disable "
+                "app.reject_empty_api_key to allow unauthenticated access).",
+            )
         return
 
+    check_lockout(request)
     token = _extract_bearer(authorization) or x_api_key or None
     if token is None:
+        record_failure(request)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing or invalid Authorization header.")
 
-    if not any(hmac.compare_digest(token, k) for k in allowed_keys):
+    if not any(_safe_equals(token, k) for k in allowed_keys):
+        record_failure(request)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid API key.")
+    record_success(request)
 
 
 async def verify_admin_key(
@@ -98,13 +126,19 @@ async def verify_admin_key(
     key = get_admin_key()
     if not key:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Admin key is not configured.")
+    if key == "grok2api" and get_config("app.reject_default_app_key", False):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Admin key is still the default 'grok2api'; set app.app_key or "
+            "disable app.reject_default_app_key.",
+        )
 
     token = _extract_bearer(authorization) or app_key
     if token is None:
         record_failure(request)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing authentication token.")
 
-    if not hmac.compare_digest(token, key):
+    if not _safe_equals(token, key):
         record_failure(request)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid authentication token.")
     record_success(request)
@@ -128,7 +162,7 @@ async def verify_webui_key(
         record_failure(request)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing authentication token.")
 
-    if not hmac.compare_digest(token, webui_key):
+    if not _safe_equals(token, webui_key):
         record_failure(request)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid authentication token.")
     record_success(request)

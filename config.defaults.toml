@@ -10,6 +10,14 @@ api_key = ""
 webui_enabled = false
 # WebUI 访问密码
 webui_key = ""
+# 安全加固开关（默认关闭，保持向后兼容；公网部署建议全部开启）
+# true = app_key 仍为默认值 "grok2api" 时拒绝管理端登录
+reject_default_app_key = false
+# true = api_key 为空时拒绝所有 /v1/* 请求（而非放行）
+reject_empty_api_key = false
+# true = 信任 X-Forwarded-For 头作为客户端 IP（仅在可信反向代理后开启）；
+# false = 直接使用 TCP 对端地址，防止伪造 XFF 绕过登录防爆破
+trust_proxy_headers = false
 
 
 # ==================== 日志配置 ====================
@@ -162,6 +170,9 @@ on_demand_min_interval_sec = 300
 [account.selection]
 # 单号并发上限（两模式共用）
 max_inflight = 8
+# random 策略下单次 429 的冷却秒数（独立于号池刷新间隔；
+# 旧实现复用 basic 池 86400s 刷新间隔，一次限流等于冷却一整天）
+cooling_sec = 600
 
 
 # ==================== 对话配置 ====================

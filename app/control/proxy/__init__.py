@@ -24,6 +24,7 @@ from .models import (
     ProxyFeedbackKind,
     RequestKind,
     ProxyScope,
+    redact_url,
 )
 from .providers.manual import ManualClearanceProvider
 from .providers.flaresolverr import FlareSolverrClearanceProvider
@@ -247,7 +248,7 @@ class ProxyDirectory:
                 self._pool_cursor += 1
                 logger.debug(
                     "proxy pool cursor advanced: proxy={} kind={} cursor={}",
-                    lease.proxy_url,
+                    redact_url(lease.proxy_url),
                     result.kind,
                     self._pool_cursor,
                 )

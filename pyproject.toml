@@ -34,3 +34,9 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "ruff>=0.15.0",
 ]
+
+[tool.pytest.ini_options]
+# Make the repo-root ``app`` package importable when running ``pytest``
+# from anywhere (previously only ``python -m pytest`` collected cleanly).
+pythonpath = ["."]
+testpaths = ["tests"]

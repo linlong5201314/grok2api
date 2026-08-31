@@ -141,15 +141,9 @@ class ConfigSnapshot:
 # ---------------------------------------------------------------------------
 
 def _apply_env(data: dict[str, Any], prefix: str = "GROK_") -> dict[str, Any]:
-    prefix_len = len(prefix)
-    for env_key, env_val in os.environ.items():
-        if not env_key.startswith(prefix):
-            continue
-        parts = env_key[prefix_len:].lower().split("_", 1)
-        if len(parts) == 2:
-            section, key = parts
-            data.setdefault(section, {})[key] = env_val
-    return data
+    from .loader import apply_env_overrides
+
+    return apply_env_overrides(data, prefix)
 
 
 # Module-level singleton — imported everywhere.

@@ -122,6 +122,16 @@ async def lifespan(app: FastAPI):
             "random value — the default lets anyone read /admin/api/tokens"
         )
 
+    # Loudly flag an open gateway: with an empty api_key every /v1/* endpoint
+    # is unauthenticated and consumes the account pool.
+    if not str(_config.get_str("app.api_key", "") or "").strip():
+        logger.error(
+            "security: app.api_key is EMPTY — /v1/* endpoints (chat, images, "
+            "videos, messages) accept unauthenticated calls and consume your "
+            "Grok account quota. Set GROK_APP_API_KEY (env) or app.api_key in "
+            "config, or enable app.reject_empty_api_key to refuse them."
+        )
+
     # 2. Initialise account repository and bootstrap runtime table.
     from app.control.account.backends.factory import (
         create_repository,

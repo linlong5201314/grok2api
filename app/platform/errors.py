@@ -7,6 +7,7 @@ class ErrorKind(StrEnum):
     VALIDATION      = "invalid_request_error"
     AUTHENTICATION  = "authentication_error"
     RATE_LIMIT      = "rate_limit_exceeded"
+    NOT_FOUND       = "not_found_error"
     UPSTREAM        = "upstream_error"
     SERVER          = "server_error"
 
@@ -64,6 +65,17 @@ class RateLimitError(AppError):
         )
 
 
+class NotFoundError(AppError):
+    """404 for missing resources (files, videos, previous responses)."""
+
+    def __init__(self, message: str, *, param: str = "") -> None:
+        super().__init__(
+            message, kind=ErrorKind.NOT_FOUND, code="not_found", status=404,
+            details={"param": param},
+        )
+        self.param = param
+
+
 class UpstreamError(AppError):
     def __init__(
         self,
@@ -88,6 +100,6 @@ class StreamIdleTimeout(AppError):
 
 __all__ = [
     "ErrorKind", "AppError",
-    "ValidationError", "AuthError", "RateLimitError",
+    "ValidationError", "AuthError", "RateLimitError", "NotFoundError",
     "UpstreamError", "StreamIdleTimeout",
 ]

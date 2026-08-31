@@ -38,6 +38,47 @@ def load_toml(path: Path) -> dict[str, Any]:
         return tomllib.load(fh)
 
 
+def apply_env_overrides(data: dict[str, Any], env_prefix: str = "GROK_") -> dict[str, Any]:
+    """Apply ``GROK_*`` environment overrides onto a nested config dict.
+
+    Two supported forms:
+
+      ``GROK_APP_API_KEY``          → ``app.api_key``   (legacy: first ``_`` splits section/key)
+      ``GROK_PROXY__EGRESS__MODE``  → ``proxy.egress.mode``  (``__`` separates path segments)
+
+    The legacy form cannot express three-level keys (``GROK_PROXY_EGRESS_MODE``
+    would map to ``proxy.egress_mode``, which is not a real config key), so
+    deeper keys must use the double-underscore form.
+    """
+    prefix_len = len(env_prefix)
+    for env_key, env_val in os.environ.items():
+        if not env_key.startswith(env_prefix):
+            continue
+        name = env_key[prefix_len:].lower()
+        if not name:
+            continue
+        if "__" in name:
+            segments = [seg for seg in name.split("__") if seg]
+        else:
+            head, _, tail = name.partition("_")
+            segments = [head, tail] if tail else [head]
+        if len(segments) < 2:
+            continue
+        _set_nested(data, segments, env_val)
+    return data
+
+
+def _set_nested(data: dict[str, Any], segments: list[str], value: Any) -> None:
+    node = data
+    for seg in segments[:-1]:
+        child = node.get(seg)
+        if not isinstance(child, dict):
+            child = {}
+            node[seg] = child
+        node = child
+    node[segments[-1]] = value
+
+
 def load_config(
     defaults_path: Path,
     user_path: Path | None = None,
@@ -45,25 +86,15 @@ def load_config(
 ) -> dict[str, Any]:
     """Load configuration: defaults → user file → environment overrides.
 
-    Environment variables use the format ``GROK_SECTION_KEY=value``,
-    which maps to the dotted key ``section.key``.
+    Environment variables use the format ``GROK_SECTION_KEY=value``
+    (→ ``section.key``) or ``GROK_SECTION__SUB__KEY=value`` for deeper keys.
     """
     data = load_toml(defaults_path)
     if user_path and user_path.exists():
         user = load_toml(user_path)
         data = _deep_merge(data, user)
 
-    # Environment overrides (GROK_PROXY_BASE_PROXY_URL → proxy.base_proxy_url)
-    prefix_len = len(env_prefix)
-    for env_key, env_val in os.environ.items():
-        if not env_key.startswith(env_prefix):
-            continue
-        parts = env_key[prefix_len:].lower().split("_", 1)
-        if len(parts) == 2:
-            section, key = parts
-            data.setdefault(section, {})[key] = env_val
-
-    return data
+    return apply_env_overrides(data, env_prefix)
 
 
 def get_nested(data: dict[str, Any], dotted_key: str, default: Any = None) -> Any:

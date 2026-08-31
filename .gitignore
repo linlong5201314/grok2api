@@ -58,3 +58,7 @@ htmlcov/
 
 # Local agent tooling config
 AGENTS.md
+
+# local CF clearance artifacts (short-lived, machine-specific)
+cf_cookie.txt
+cf_ua.txt

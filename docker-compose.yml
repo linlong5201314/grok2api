@@ -16,7 +16,9 @@ services:
       ACCOUNT_MYSQL_URL: ${ACCOUNT_MYSQL_URL:-}
       ACCOUNT_POSTGRESQL_URL: ${ACCOUNT_POSTGRESQL_URL:-}
       # 启用 CF 自动刷新时，建议通过 config.toml 设置 proxy.clearance.*
-      # 或使用 GROK_PROXY_CLEARANCE_MODE / GROK_PROXY_CLEARANCE_FLARESOLVERR_URL 等环境变量
+      # 或使用双下划线形式的三级键环境变量：
+      #   GROK_PROXY__CLEARANCE__MODE / GROK_PROXY__CLEARANCE__FLARESOLVERR_URL
+      # （单下划线写法 GROK_PROXY_CLEARANCE_* 只能表达两级键，不生效）
 
       # ACCOUNT_STORAGE: local | redis | mysql | postgresql
       # ACCOUNT_LOCAL_PATH: SQLite path when ACCOUNT_STORAGE=local

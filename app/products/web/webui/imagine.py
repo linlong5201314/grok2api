@@ -49,7 +49,12 @@ def _is_allowed(token: str) -> bool:
     webui_key = get_webui_key()
     if not webui_key:
         return is_webui_enabled()
-    return bool(token) and hmac.compare_digest(token, webui_key)
+    if not token:
+        return False
+    try:
+        return hmac.compare_digest(token.encode("utf-8"), webui_key.encode("utf-8"))
+    except (UnicodeEncodeError, AttributeError):
+        return False
 
 
 def _websocket_token(websocket: WebSocket) -> str:

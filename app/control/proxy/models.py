@@ -107,8 +107,33 @@ class ProxyFeedback(BaseModel):
     retry_after_ms: int | None = None
 
 
+def redact_url(url: str | None) -> str:
+    """Mask userinfo credentials in a proxy URL for safe logging.
+
+    ``socks5h://user:pass@host:1080`` → ``socks5h://***@host:1080``.
+    Subscription node URLs embed airport credentials, so raw URLs must
+    never reach the log files.
+    """
+    if not url:
+        return ""
+    raw = str(url)
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(raw)
+    except Exception:
+        return raw
+    if not parts.scheme or "@" not in parts.netloc:
+        return raw
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, f"***@{host}", parts.path, parts.query, parts.fragment))
+
+
 __all__ = [
     "ProxyScope", "RequestKind", "EgressMode", "ClearanceMode",
     "EgressNodeState", "ClearanceBundleState", "ProxyFeedbackKind",
     "EgressNode", "ClearanceBundle", "ProxyLease", "ProxyFeedback",
+    "redact_url",
 ]

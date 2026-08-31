@@ -10,7 +10,7 @@ from aiohttp_socks import ProxyConnector
 
 from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
-from app.control.proxy.models import ProxyLease
+from app.control.proxy.models import ProxyLease, redact_url
 
 
 def _ssl_ctx() -> ssl.SSLContext:
@@ -46,9 +46,9 @@ def _build_connector(
         kwargs: dict = {"ssl": ssl_ctx}
         if rdns is not None:
             kwargs["rdns"] = rdns
-        logger.debug("websocket connector selected: proxy_type=socks proxy_url={}", proxy_url)
+        logger.debug("websocket connector selected: proxy_type=socks proxy_url={}", redact_url(proxy_url))
         return ProxyConnector.from_url(normalized, **kwargs), None
-    logger.debug("websocket connector selected: proxy_type=http proxy_url={}", proxy_url)
+    logger.debug("websocket connector selected: proxy_type=http proxy_url={}", redact_url(proxy_url))
     return aiohttp.TCPConnector(ssl=ssl_ctx), proxy_url
 
 
