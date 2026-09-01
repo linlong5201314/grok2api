@@ -65,6 +65,20 @@ def _is_cloudflare_challenge(resp) -> bool:
     return False
 
 
+def _clearance_enabled() -> bool:
+    """Whether a Cloudflare clearance mode (manual/flaresolverr) is active.
+
+    When it is, a challenged node is still production-usable — clearance is
+    solved per node and the challenge is expected on most datacenter egress.
+    """
+    try:
+        from app.platform.config.snapshot import get_config
+
+        return get_config().get_str("proxy.clearance.mode", "none").lower() != "none"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _is_grok_origin_response(resp) -> bool:
     """Return True only for a genuine answer from the grok origin.
 
@@ -134,12 +148,22 @@ class NodeSpeedTester:
     async def probe(self, node: SubNode) -> ProbeOutcome:
         async with self._semaphore:
             latency, http_state = await self._http_probe(node)
-            # A Cloudflare challenge response means the tunnel works but the
-            # egress IP is blocked for grok.com API traffic — do NOT fall back
-            # to a TCP success, otherwise challenged nodes are marked healthy.
+            # A Cloudflare challenge response means the tunnel works and the
+            # egress reaches the grok edge — only the bot check blocks it.
+            # When a clearance mode is enabled, that is exactly the traffic
+            # profile clearance exists for, so the node stays usable (scored
+            # by its real TTFB) instead of being failed out of the pool.
             if http_state == "challenge":
-                self._apply_failure(node)
                 node.last_error = "cloudflare-challenge"
+                if _clearance_enabled() and latency is not None:
+                    self._apply_success(node, latency)
+                    return ProbeOutcome(
+                        node.node_id,
+                        ok=True,
+                        latency_ms=latency,
+                        error="cloudflare-challenge",
+                    )
+                self._apply_failure(node)
                 return ProbeOutcome(
                     node.node_id,
                     ok=False,
@@ -209,12 +233,12 @@ class NodeSpeedTester:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             if resp.status_code > 0:
                 if _is_cloudflare_challenge(resp):
-                    return None, "challenge"
+                    return elapsed_ms, "challenge"
                 # grok.com only ever answers 401 (bad credentials) to the
                 # probe; any other 403 on the rate-limits endpoint is a
                 # Cloudflare / geo block, not an auth answer.
                 if is_default_probe and resp.status_code == 403:
-                    return None, "challenge"
+                    return elapsed_ms, "challenge"
                 if is_default_probe and not _is_grok_origin_response(resp):
                     # Not a genuine grok answer — e.g. sing-box returned its
                     # own error page because the outbound is dead.  Counting

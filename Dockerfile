@@ -1,5 +1,5 @@
 # ── Builder ───────────────────────────────────────────────────────────────────
-FROM python:3.13-alpine AS builder
+FROM python:3.13-slim-bookworm AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -7,17 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 
-# Rust/Cargo are required to compile curl-cffi wheels on musl/Alpine.
-# If upstream ever ships musl wheels, remove cargo + rust to speed up builds.
-RUN apk add --no-cache \
-    ca-certificates \
-    build-base \
-    linux-headers \
-    libffi-dev \
-    openssl-dev \
-    curl-dev \
-    cargo \
-    rust
+# glibc wheels exist for every dependency (curl-cffi, orjson, tiktoken, ...),
+# so no compiler toolchain is needed on Debian slim.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -36,7 +30,7 @@ RUN uv sync --frozen --no-dev --no-install-project \
     && rm -rf /root/.cache /tmp/uv-cache
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
-FROM python:3.13-alpine
+FROM python:3.13-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -48,26 +42,35 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-RUN apk add --no-cache \
-    tzdata \
-    ca-certificates \
-    libffi \
-    openssl \
-    libgcc \
-    libstdc++ \
-    libcurl
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        tzdata \
+        ca-certificates \
+        libcurl4 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Bundle sing-box so subscription core-protocol nodes (vmess/vless/trojan/ss/
-# hysteria2) work out of the box; the app auto-detects it on PATH.
+# Bundle the OFFICIAL sing-box release so subscription core-protocol nodes
+# (vmess/vless+reality/trojan/ss/hysteria2) work out of the box.
 #
-# NOTE: official SagerNet release tarballs are glibc-DYNAMICALLY linked and
-# abort with "sing-box: not found" on musl-based Alpine (the ELF interpreter
-# /lib64/ld-linux-x86-64.so.2 does not exist there). Use Alpine's own
-# natively-compiled package from edge/community instead.
-RUN apk add --no-cache \
-        --repository https://dl-cdn.alpinelinux.org/alpine/edge/community \
-    sing-box \
-    && sing-box version
+# NOTE: Alpine's own musl sing-box package fails REALITY verification against
+# live vless-reality servers ("reality verification failed"), which is fatal
+# for every chat request through such nodes. The official glibc build handles
+# the same config correctly — and on a glibc base it runs without compat hacks.
+ARG SINGBOX_VERSION=1.12.9
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+        x86_64)  sb_arch="amd64" ;; \
+        aarch64) sb_arch="arm64" ;; \
+        *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${sb_arch}.tar.gz"; \
+    python -c "import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], '/tmp/sing-box.tar.gz')" "$url"; \
+    tar -xzf /tmp/sing-box.tar.gz -C /tmp; \
+    mv "/tmp/sing-box-${SINGBOX_VERSION}-linux-${sb_arch}/sing-box" /usr/local/bin/sing-box; \
+    chmod +x /usr/local/bin/sing-box; \
+    rm -rf /tmp/sing-box.tar.gz "/tmp/sing-box-${SINGBOX_VERSION}-linux-${sb_arch}"; \
+    sing-box version
 
 WORKDIR /app
 
@@ -83,7 +86,7 @@ RUN mkdir -p /app/data /app/logs \
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD ["sh", "-c", "wget -qO /dev/null http://127.0.0.1:${SERVER_PORT}/health || exit 1"]
+    CMD ["python", "-c", "import urllib.request,os; urllib.request.urlopen(f\"http://127.0.0.1:{os.environ.get('SERVER_PORT','8000')}/health\", timeout=4)"]
 
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 CMD ["sh", "-c", "exec granian --interface asgi --host ${SERVER_HOST} --port ${SERVER_PORT} --workers ${SERVER_WORKERS} app.main:app"]
