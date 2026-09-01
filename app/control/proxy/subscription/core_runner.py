@@ -355,11 +355,13 @@ def _node_to_outbound(node: SubNode) -> dict | None:
         }
         if node.alpn:
             tls_block["alpn"] = node.alpn
-        if node.client_fingerprint:
-            tls_block["utls"] = {
-                "enabled": True,
-                "fingerprint": node.client_fingerprint,
-            }
+        # utls expects a browser name (chrome/ios/safari/...).  Hysteria2
+        # nodes carry a 64-hex certificate *pin* in their `fingerprint`
+        # field instead — feeding that to utls is a FATAL config error
+        # ("unknown uTLS fingerprint"), so gate on the value's shape.
+        fp = (node.client_fingerprint or "").strip()
+        if fp and fp.isalpha() and len(fp) <= 16:
+            tls_block["utls"] = {"enabled": True, "fingerprint": fp}
         if node.public_key:
             tls_block["reality"] = {
                 "enabled": True,
