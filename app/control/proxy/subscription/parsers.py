@@ -577,6 +577,37 @@ def parse_clash_yaml(text: str, source_id: str = "") -> list[SubNode]:
     return nodes
 
 
+def _split_flow_list(inner: str) -> list[str]:
+    """Split a YAML flow-list body on commas, respecting quotes and nested
+    brackets (e.g. ``h2, http/1.1`` inside ``[h2, http/1.1]``)."""
+    parts: list[str] = []
+    depth = 0
+    quote = ""
+    buf = ""
+    for ch in inner:
+        if quote:
+            if ch == quote:
+                quote = ""
+            buf += ch
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf += ch
+            continue
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    if buf.strip():
+        parts.append(buf)
+    return [p.strip() for p in parts if p.strip()]
+
+
 def _coerce(raw: str) -> Any:
     raw = raw.strip()
     if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
@@ -600,6 +631,10 @@ def _coerce(raw: str) -> Any:
         pass
     if raw.startswith("{") and raw.endswith("}"):
         return _parse_inline_dict(raw)
+    if raw.startswith("[") and raw.endswith("]"):
+        # Inline flow list, e.g. alpn: [h2, http/1.1] — previously returned
+        # as a raw string and silently dropped downstream.
+        return [_coerce(part) for part in _split_flow_list(raw[1:-1])]
     return raw
 
 
