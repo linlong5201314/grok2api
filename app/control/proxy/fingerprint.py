@@ -76,8 +76,16 @@ def _supported_chrome_versions() -> list[int]:
         return [120, 124, 131, 133, 136]
 
 
+# Ancient Chrome versions (<= 3 years old) are a bot signal on their own —
+# Cloudflare's current detection treats a Chrome/99 UA or TLS hello as an
+# immediate red flag.  Keep the pool to roughly the last few majors.
+_MIN_CHROME_VERSION = 124
+
+
 def _ua_pool() -> list[str]:
-    versions = _supported_chrome_versions() or [136]
+    versions = [v for v in _supported_chrome_versions() if v >= _MIN_CHROME_VERSION]
+    if not versions:
+        versions = [136]
     pool: list[str] = []
     for ver in versions:
         for template in _UA_TEMPLATES.values():
