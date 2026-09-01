@@ -95,6 +95,10 @@ resource_proxy_url = ""
 resource_proxy_pool = []
 # 跳过代理 SSL 证书验证（代理使用自签名证书时启用）
 skip_ssl_verify = false
+# 禁用浏览器 TLS 指纹模拟（诊断开关：某些 musl/Alpine 环境的 curl-impersonate
+# 在「指纹模拟+HTTP 代理」组合下会触发 TLS invalid library / WRONG_VERSION_NUMBER，
+# 置 true 可回退到普通 TLS 验证该问题）
+disable_impersonate = false
 
 [proxy.subscription]
 # 机场订阅链接列表（支持 base64 节点列表 / Clash YAML；也可在后台页面添加）

@@ -20,6 +20,20 @@ def _skip_proxy_ssl(proxy_url: str) -> bool:
     return cfg.get_bool("proxy.egress.skip_ssl_verify", False)
 
 
+def _impersonate_disabled() -> bool:
+    """Global kill-switch for browser impersonation.
+
+    Diagnostic/escape hatch for platforms where the bundled curl-impersonate
+    build misbehaves *only when impersonation is combined with an HTTP proxy*
+    (observed as TLS "invalid library" / WRONG_VERSION_NUMBER through
+    sing-box inbounds on musl/Alpine while direct and plain requests work).
+    """
+    try:
+        return get_config().get_bool("proxy.egress.disable_impersonate", False)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 _CA_BUNDLE: str | None = None
 
 
@@ -81,7 +95,7 @@ def build_session_kwargs(
     kwargs: dict[str, Any] = dict(extra or {})
 
     # Browser impersonation.
-    if not kwargs.get("impersonate"):
+    if not kwargs.get("impersonate") and not _impersonate_disabled():
         browser = browser_override or resolve_proxy_profile(lease).browser
         if browser:
             kwargs["impersonate"] = browser
