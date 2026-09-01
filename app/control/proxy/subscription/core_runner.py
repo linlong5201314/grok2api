@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+from collections import deque
 from pathlib import Path
 
 from app.platform.logging.logger import logger
@@ -46,10 +47,18 @@ class CoreRunner:
         self._config_path: Path | None = None
         self._port_map: dict[str, int] = {}  # node_id -> local port
         self._sig: tuple | None = None
+        self._stderr_buf: deque[str] = deque(maxlen=200)
+        self._drain_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------
+
+    def recent_stderr(self, limit: int = 50) -> list[str]:
+        """Return the most recent sing-box stderr lines (drain buffer)."""
+        if limit <= 0:
+            return []
+        return list(self._stderr_buf)[-limit:]
 
     def resolve_binary(self) -> str:
         """Return the sing-box executable path, or '' when unavailable.
@@ -160,19 +169,19 @@ class CoreRunner:
             self._process = None
             return {}
 
+        # Drain stderr continuously into the ring buffer: an unread PIPE
+        # fills its 1 MB limit and then blocks sing-box on write, silently
+        # freezing every local inbound while is_running still reports True.
+        self._drain_task = asyncio.create_task(
+            self._drain_stderr(self._process), name="sing-box-stderr-drain"
+        )
+
         ready = await self._wait_ports_ready(set(self._port_map.values()))
         if not ready:
-            stderr = b""
-            if self._process.stderr is not None:
-                try:
-                    stderr = await asyncio.wait_for(
-                        self._process.stderr.read(65536), timeout=2.0
-                    )
-                except Exception:
-                    pass
+            stderr = "\n".join(self.recent_stderr(20))[:500]
             logger.warning(
                 "sing-box ports did not open; stopping core: detail={}",
-                stderr.decode(errors="replace")[:500],
+                stderr,
             )
             await self.stop()
             return {}
@@ -190,6 +199,13 @@ class CoreRunner:
     async def stop(self) -> None:
         proc, self._process = self._process, None
         self._sig = None
+        drain, self._drain_task = self._drain_task, None
+        if drain is not None:
+            drain.cancel()
+            try:
+                await drain
+            except (asyncio.CancelledError, Exception):
+                pass
         if proc is None:
             return
         try:
@@ -204,6 +220,19 @@ class CoreRunner:
         except Exception as exc:  # noqa: BLE001
             logger.debug("sing-box stop error: {}", exc)
         logger.info("sing-box stopped")
+
+    async def _drain_stderr(self, proc: asyncio.subprocess.Process) -> None:
+        """Continuously drain sing-box stderr into the ring buffer."""
+        if proc.stderr is None:
+            return
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    return
+                self._stderr_buf.append(line.decode("utf-8", "replace").rstrip())
+        except (asyncio.CancelledError, Exception):
+            return
 
     # ------------------------------------------------------------------
     # Config generation

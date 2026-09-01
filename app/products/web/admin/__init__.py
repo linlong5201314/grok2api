@@ -249,6 +249,41 @@ async def runtime_status():
     )
 
 
+def _tail_log_file(path, lines: int) -> list[str]:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            fh.seek(max(0, size - 512 * 1024))
+            data = fh.read()
+        return data.decode("utf-8", "replace").splitlines()[-lines:]
+    except OSError:
+        return []
+
+
+@router.get("/logs/tail", tags=[_TAG_ADMIN_SYSTEM])
+async def logs_tail(lines: int = 200):
+    """Read-only diagnostics: tail the app log file and the sing-box stderr
+    drain buffer, so deployments without shell access (PaaS) stay debuggable."""
+    import datetime
+
+    from app.platform.paths import log_path
+
+    lines = max(1, min(lines, 1000))
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    log_lines = _tail_log_file(log_path(f"app_{today}.log"), lines)
+
+    core_info: dict = {"running": None, "stderr": []}
+    try:
+        from app.control.proxy.subscription import get_subscription_manager
+
+        core = get_subscription_manager()._core  # noqa: SLF001
+        core_info = {"running": core.is_running, "stderr": core.recent_stderr(50)}
+    except Exception:
+        pass
+
+    return {"lines": log_lines, "core": core_info}
+
+
 @router.post("/sync", tags=[_TAG_ADMIN_SYSTEM])
 async def force_sync():
     from app.dataplane.account import _directory
