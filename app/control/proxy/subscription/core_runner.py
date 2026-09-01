@@ -251,6 +251,9 @@ class CoreRunner:
         if not inbounds:
             logger.warning("no core-protocol nodes could be mapped to local ports")
             return None
+        # sing-box >= 1.12 requires an explicit direct outbound when
+        # route.final references it ("default outbound not found: direct").
+        outbounds.append({"type": "direct", "tag": "direct"})
         return {
             "log": {"level": "warn"},
             "inbounds": inbounds,
