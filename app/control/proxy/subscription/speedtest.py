@@ -279,7 +279,13 @@ class NodeSpeedTester:
     def _apply_success(self, node: SubNode, latency_ms: float) -> None:
         node.latency_ms = round(latency_ms, 1)
         node.loss_rate = _ALPHA * 0.0 + (1.0 - _ALPHA) * node.loss_rate
-        node.fail_count = 0
+        # Decay rather than reset the consecutive-failure streak: probes use a
+        # small request shape that can pass nodes (e.g. reality-vision) which
+        # production traffic (larger/streaming requests) keeps killing.  If a
+        # probe success fully reset the streak, every probe cycle would
+        # resurrect those nodes at the top of the pool while real requests
+        # continue to die — observed exactly that on Zeabur.
+        node.fail_count = max(0, node.fail_count - 1)
         node.ok_count += 1
         node.last_probe_at = now_ms()
         # Slow-but-alive nodes degrade instead of dying so bound accounts get
