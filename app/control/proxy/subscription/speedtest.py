@@ -69,17 +69,19 @@ def _is_grok_origin_response(resp) -> bool:
     """Return True only for a genuine answer from the grok origin.
 
     The probe sends bogus credentials, so the sole legitimate reply is a
-    401 JSON error from grok.com itself.  A proxy/sing-box error page
-    (instant, plaintext) also satisfies ``status_code > 0`` and must NOT be
-    counted as a healthy node — otherwise dead nodes score lowest-latency
-    and soak up all account bindings.
+    401 whose body carries grok's own credentials error string
+    (``Bad credentials`` / ``bad-credentials`` / ``unauthenticated``).
+    Matching a bare ``code`` key would also pass generic auth-error pages
+    served instantly by a dead relay's fallback site (observed as healthy
+    nodes with physically impossible ~1.4 ms "latency", which then soak up
+    every account binding).
     """
     if int(getattr(resp, "status_code", 0) or 0) != 401:
         return False
     try:
         body = getattr(resp, "content", None) or b""
         text = (body if isinstance(body, bytes) else str(body).encode())[:2000].lower()
-        return b"credentials" in text or b"code" in text
+        return b"credentials" in text
     except Exception:  # noqa: BLE001
         return False
 
