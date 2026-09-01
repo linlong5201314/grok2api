@@ -220,6 +220,11 @@ class ProxyDirectory:
             ProxyFeedbackKind.UNAUTHORIZED,
             ProxyFeedbackKind.FORBIDDEN,
             ProxyFeedbackKind.TRANSPORT_ERROR,
+            # TLS resets / mid-stream failures surface as 502 (UPSTREAM_5XX) —
+            # they must also demote the node, otherwise production-broken
+            # nodes (reality-vision etc.) never accumulate failures and never
+            # leave the binding pool.
+            ProxyFeedbackKind.UPSTREAM_5XX,
         )
 
         # SUBSCRIPTION mode: propagate failures onto the bound node so the
