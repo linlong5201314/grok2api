@@ -342,7 +342,12 @@ async def _tcp_ready(port: int) -> bool:
 def _node_to_outbound(node: SubNode) -> dict | None:
     """Translate a SubNode into a sing-box outbound (without tag)."""
     tls_block = None
-    if node.sni or node.protocol.value in ("trojan", "hysteria2", "tuic"):
+    needs_tls = (
+        node.sni
+        or node.public_key
+        or node.protocol.value in ("trojan", "hysteria2", "tuic", "anytls")
+    )
+    if needs_tls:
         tls_block = {
             "enabled": True,
             "server_name": node.sni or node.server,
@@ -350,6 +355,17 @@ def _node_to_outbound(node: SubNode) -> dict | None:
         }
         if node.alpn:
             tls_block["alpn"] = node.alpn
+        if node.client_fingerprint:
+            tls_block["utls"] = {
+                "enabled": True,
+                "fingerprint": node.client_fingerprint,
+            }
+        if node.public_key:
+            tls_block["reality"] = {
+                "enabled": True,
+                "public_key": node.public_key,
+                "short_id": node.short_id,
+            }
 
     transport_block = None
     if node.transport == "ws":
@@ -405,10 +421,16 @@ def _node_to_outbound(node: SubNode) -> dict | None:
         if not node.credential:
             return None
         base.update({"type": "vless", "uuid": node.credential})
+        if node.flow:
+            base["flow"] = node.flow
     elif p.value == "trojan":
         if not node.credential:
             return None
         base.update({"type": "trojan", "password": node.credential})
+    elif p.value == "anytls":
+        if not node.credential:
+            return None
+        base.update({"type": "anytls", "password": node.credential})
     elif p.value == "hysteria2":
         base.update({"type": "hysteria2", "password": node.credential})
     elif p.value == "tuic":

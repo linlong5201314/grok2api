@@ -30,6 +30,7 @@ class SubProtocol(StrEnum):
     TROJAN = "trojan"
     HYSTERIA2 = "hysteria2"
     TUIC = "tuic"
+    ANYTLS = "anytls"
     UNKNOWN = "unknown"
 
 
@@ -52,6 +53,7 @@ CORE_PROTOCOLS = frozenset(
         SubProtocol.TROJAN,
         SubProtocol.HYSTERIA2,
         SubProtocol.TUIC,
+        SubProtocol.ANYTLS,
     }
 )
 
@@ -74,6 +76,7 @@ def parse_protocol(value: str) -> SubProtocol:
         "hysteria2": SubProtocol.HYSTERIA2,
         "hy2": SubProtocol.HYSTERIA2,
         "tuic": SubProtocol.TUIC,
+        "anytls": SubProtocol.ANYTLS,
         "http": SubProtocol.HTTP,
         "https": SubProtocol.HTTPS,
     }
@@ -109,6 +112,13 @@ class SubNode(BaseModel):
     allow_insecure: bool = False
     udp: bool = True
     plugin: str = ""                   # ss plugin string (obfs/v2ray-plugin)
+    # vless reality / flow parameters (dropped by naive parsers — without
+    # them sing-box speaks plain vless to a reality server and gets the
+    # camouflage fallback instead of the proxy tunnel).
+    flow: str = ""                     # e.g. xtls-rprx-vision
+    public_key: str = ""               # reality public key (pbk)
+    short_id: str = ""                 # reality short id (sid)
+    client_fingerprint: str = ""       # utls fingerprint (fp / client-fingerprint)
     raw_uri: str = ""                  # original share link (redact before display)
     source_id: str = ""
 
@@ -138,7 +148,10 @@ class SubNode(BaseModel):
 
     def identity(self) -> str:
         """Stable identity independent of node name ordering."""
-        return f"{self.protocol.value}|{self.server}|{self.port}|{self.credential}"
+        return (
+            f"{self.protocol.value}|{self.server}|{self.port}|{self.credential}"
+            f"|{self.public_key}|{self.short_id}|{self.transport}"
+        )
 
     def display_name(self) -> str:
         return self.name or f"{self.server}:{self.port}"

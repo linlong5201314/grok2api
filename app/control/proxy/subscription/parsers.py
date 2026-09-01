@@ -351,6 +351,10 @@ def _parse_vless(uri: str) -> SubNode | None:
         sni=sni if security in ("tls", "reality") else "",
         alpn=[a for a in q.get("alpn", "").split(",") if a],
         allow_insecure=q.get("allowInsecure", "0") in ("1", "true"),
+        flow=q.get("flow", ""),
+        public_key=q.get("pbk", ""),
+        short_id=q.get("sid", ""),
+        client_fingerprint=q.get("fp", ""),
         raw_uri=uri,
     )
 
@@ -651,6 +655,7 @@ def _clash_item_to_node(item: dict[str, Any], source_id: str) -> SubNode | None:
     tls = bool(item.get("tls", False)) or protocol in (
         SubProtocol.TROJAN,
         SubProtocol.HYSTERIA2,
+        SubProtocol.ANYTLS,
     )
     sni = str(item.get("servername", "") or item.get("sni", "") or "")
 
@@ -662,7 +667,12 @@ def _clash_item_to_node(item: dict[str, Any], source_id: str) -> SubNode | None:
     elif protocol == SubProtocol.VMESS:
         credential = str(item.get("uuid", ""))
         method = str(item.get("cipher", "auto"))
-    elif protocol in (SubProtocol.VLESS, SubProtocol.TROJAN, SubProtocol.HYSTERIA2):
+    elif protocol in (
+        SubProtocol.VLESS,
+        SubProtocol.TROJAN,
+        SubProtocol.HYSTERIA2,
+        SubProtocol.ANYTLS,
+    ):
         credential = str(item.get("password", "") or item.get("uuid", ""))
     elif protocol in (SubProtocol.SOCKS4, SubProtocol.SOCKS5):
         credential = str(item.get("username", "")) + (
@@ -671,6 +681,19 @@ def _clash_item_to_node(item: dict[str, Any], source_id: str) -> SubNode | None:
 
     alpn_raw = item.get("alpn")
     alpn = [str(a) for a in alpn_raw] if isinstance(alpn_raw, list) else []
+
+    # vless reality / flow and utls fingerprint — without these the core
+    # builds a plain vless outbound and reality servers serve the fallback.
+    flow = str(item.get("flow", "") or "")
+    client_fingerprint = str(
+        item.get("client-fingerprint", "") or item.get("fingerprint", "") or ""
+    )
+    public_key = ""
+    short_id = ""
+    reality_opts = item.get("reality-opts")
+    if isinstance(reality_opts, dict):
+        public_key = str(reality_opts.get("public-key", "") or "")
+        short_id = str(reality_opts.get("short-id", "") or "")
 
     # shadowsocks obfs / v2ray-plugin (sing-box shadowsocks plugin support).
     plugin = ""
@@ -703,6 +726,10 @@ def _clash_item_to_node(item: dict[str, Any], source_id: str) -> SubNode | None:
         allow_insecure=bool(item.get("skip-cert-verify", False)),
         udp=bool(item.get("udp", True)),
         plugin=plugin,
+        flow=flow,
+        public_key=public_key,
+        short_id=short_id,
+        client_fingerprint=client_fingerprint,
         source_id=source_id,
     )
     node.node_id = _make_node_id(source_id, node.identity())
