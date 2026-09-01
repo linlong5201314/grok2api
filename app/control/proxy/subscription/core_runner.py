@@ -251,14 +251,18 @@ class CoreRunner:
         if not inbounds:
             logger.warning("no core-protocol nodes could be mapped to local ports")
             return None
-        # sing-box >= 1.12 requires an explicit direct outbound when
-        # route.final references it ("default outbound not found: direct").
-        outbounds.append({"type": "direct", "tag": "direct"})
+        # NOTE: do NOT declare a "direct" outbound and do NOT set route.final.
+        # Some sing-box builds (e.g. Alpine community) auto-include a direct
+        # outbound, so an explicit one is a duplicate-tag FATAL; official
+        # 1.12+ releases, on the other hand, refuse "route.final: direct"
+        # without a declaration.  Since every inbound already has an explicit
+        # rule to its node outbound, omitting both is compatible with all
+        # builds — the final never fires.
         return {
             "log": {"level": "warn"},
             "inbounds": inbounds,
             "outbounds": outbounds,
-            "route": {"rules": rules, "final": "direct"},
+            "route": {"rules": rules},
         }
 
     async def _wait_ports_ready(self, ports: set[int], timeout_s: float = 12.0) -> bool:
